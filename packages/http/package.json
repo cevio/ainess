@@ -1,0 +1,39 @@
+{
+  "name": "@ainess/http",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./controllers": {
+      "types": "./dist/controllers.d.ts",
+      "default": "./dist/controllers.js"
+    },
+    "./request-signal": {
+      "types": "./dist/request-signal.d.ts",
+      "default": "./dist/request-signal.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@ainess/loader": "workspace:*",
+    "@standard-schema/spec": "1.1.0",
+    "@types/koa": "3.0.3",
+    "find-my-way": "9.10.2",
+    "koa": "3.3.0",
+    "koa-compose": "4.1.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "catalog:"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "catalog:",
+    "@types/koa-compose": "3.2.9"
+  }
+}

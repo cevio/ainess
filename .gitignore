@@ -1,0 +1,4 @@
+node_modules/
+dist/
+.agents
+/packages/http-next/test/fixtures/web/next-env.d.ts

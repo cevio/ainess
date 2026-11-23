@@ -1,0 +1,8 @@
+packages:
+  - 'packages/*'
+
+catalog:
+  '@deepseek-ai/cordis': 4.1.0
+
+patchedDependencies:
+  next@16.4.6: patches/next@16.4.6.patch

@@ -1,0 +1,16 @@
+{
+  "name": "ainess",
+  "private": true,
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": "^22.13.0 || >=24.11.0"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm run build && tsc -p tsconfig.test.json && node --test 'packages/*/test/**/*.test.js' && pnpm -r --if-present run test:integration"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
+  }
+}
