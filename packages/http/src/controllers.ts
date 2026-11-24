@@ -17,6 +17,23 @@ export interface HttpControllersOptions extends Omit<LoadModulesOptions, 'suffix
   prefix?: string
 }
 
+export interface HttpControllerDirectoryOptions extends HttpControllersOptions {
+  inject?: readonly string[]
+}
+
+export function httpControllers({ inject = [], ...options }: HttpControllerDirectoryOptions) {
+  if (!Array.isArray(inject)) throw new TypeError('Controller inject must be an array of service names')
+  const dependencies: string[] = ['http', ...inject]
+  if (dependencies.some(name => typeof name !== 'string' || !name)) {
+    throw new TypeError('Controller inject entries must be non-empty service names')
+  }
+  return {
+    name: 'http-controllers',
+    inject: dependencies,
+    apply: (ctx: Context) => loadHttpControllers(ctx, options),
+  }
+}
+
 function controllerError(file: string, cause: unknown): Error {
   const detail = cause instanceof Error ? `: ${cause.message}` : ''
   return new Error(`Failed to load HTTP controller ${file}${detail}`, { cause })
@@ -27,19 +44,24 @@ export async function loadHttpControllers(
   { directory, extensions, prefix = '' }: HttpControllersOptions,
 ): Promise<void> {
   if (prefix) parseFileRoute('index', { prefix, source: 'HTTP controller prefix' })
-  let cancelled = false
+  const loading = new AbortController()
+  const { signal } = loading
   const stopPreparing = ctx.effect(function* () {
-    yield () => { cancelled = true }
+    yield () => loading.abort()
+    yield ctx.on('internal/plugin', (fiber) => {
+      if (fiber === ctx.fiber && fiber.uid === null) loading.abort()
+    })
     yield ctx.on('internal/service', (name) => {
       if ((name === 'http' || Object.hasOwn(ctx.fiber.inject, name)) && ctx.get(name) === undefined) {
-        cancelled = true
+        loading.abort()
       }
     })
   }, 'loadHttpControllers.prepare()')
+  const isCancelled = () => signal.aborted || ctx.fiber.uid === null
 
   try {
     const files = await scanModules({ directory, suffix: 'controller', extensions })
-    if (cancelled || ctx.fiber.uid === null) return
+    if (isCancelled()) return
 
     const fileRoutes = files.map(file => {
       const segments = parseFileRoute(file.stem, { prefix, source: file.relativePath })
@@ -55,9 +77,7 @@ export async function loadHttpControllers(
     const modules = await importModules(files, (value) => {
       if (typeof value !== 'function') throw new TypeError('The default export must be a controller factory')
       return value as (ctx: Context) => unknown
-    })
-    if (cancelled || ctx.fiber.uid === null) return
-
+    }, signal)
     const routes: {
       file: string
       path: string
@@ -66,6 +86,7 @@ export async function loadHttpControllers(
       catchAllName?: string
     }[] = []
     for (const [index, { file, value: create }] of modules.entries()) {
+      if (isCancelled()) return
       const { path, catchAllName } = fileRoutes[index]
       try {
         const result = create(ctx)
@@ -99,7 +120,7 @@ export async function loadHttpControllers(
       }
     }
 
-    if (!routes.length) return
+    if (!routes.length || isCancelled()) return
     ctx.effect(function* () {
       for (const { file, method, path, middlewares, catchAllName } of routes) {
         try {
@@ -109,6 +130,8 @@ export async function loadHttpControllers(
         }
       }
     }, 'loadHttpControllers()')
+  } catch (error) {
+    if (!signal.aborted || error !== signal.reason) throw error
   } finally {
     await stopPreparing()
   }

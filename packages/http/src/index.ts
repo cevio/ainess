@@ -4,7 +4,7 @@ import findMyWay from 'find-my-way'
 import Koa from 'koa'
 import compose from 'koa-compose'
 import { createListener, type HttpHandler, type HttpListenerOptions } from './listener.js'
-import { findRoute, registerRoute, type HttpRouter, type RegisteredRoute } from './route.js'
+import { findRoute, registerHttpRoute, registerRoute, type HttpRouter } from './route.js'
 
 export { defineController, type HttpControllerInput, type HttpControllerOptions } from './controller.js'
 export type { HttpHandler, HttpListenerOptions, HttpPrepare, PreparedHttp } from './listener.js'
@@ -95,11 +95,11 @@ class Http extends Service {
     }
     if (!middleware.length) throw new TypeError('An HTTP route requires at least one middleware')
     const { router } = this
-    const store: RegisteredRoute = { handle: compose(middleware), catchAllName }
-    return this.ctx.effect(() => {
-      router.on(method, path, () => {}, store)
-      return () => { router.off(method, path) }
-    }, `http.route(${method} ${path})`)
+    const handle = compose(middleware)
+    return this.ctx.effect(
+      () => registerHttpRoute(router, method, path, handle, catchAllName),
+      `http.route(${method} ${path})`,
+    )
   }
 
   address(): AddressInfo | null {

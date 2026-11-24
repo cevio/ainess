@@ -24,6 +24,9 @@ export async function scanModules(
   if (!suffix || suffix.includes('/') || suffix.includes('\\')) {
     throw new TypeError('The module suffix must be a non-empty part of a file name')
   }
+  if (!Array.isArray(extensions) || extensions.some(extension => typeof extension !== 'string')) {
+    throw new TypeError('Module extensions must be an array of strings')
+  }
   const root = typeof directory === 'string' ? resolve(directory) : fileURLToPath(directory)
   const scanRoot = await realpath(root)
   // Surface errors opening the scan root before checking for matches.
@@ -65,17 +68,22 @@ export async function scanModules(
 export async function importModules<T>(
   files: readonly ModuleFile[],
   decode: (value: unknown, file: ModuleFile) => T | Promise<T>,
+  signal?: AbortSignal,
 ): Promise<readonly { file: ModuleFile; value: T }[]> {
+  signal?.throwIfAborted()
   const modules: { file: ModuleFile; value: T }[] = []
   for (const file of files) {
     try {
       const namespace: { default?: unknown } = await import(pathToFileURL(file.absolutePath).href)
+      signal?.throwIfAborted()
       if (!Object.hasOwn(namespace, 'default')) throw new TypeError('A default export is required')
       modules.push({ file, value: await decode(namespace.default, file) })
     } catch (cause) {
+      signal?.throwIfAborted()
       const detail = cause instanceof Error ? `: ${cause.message}` : ''
       throw new Error(`Failed to load ${file.relativePath}${detail}`, { cause })
     }
+    signal?.throwIfAborted()
   }
   return modules
 }

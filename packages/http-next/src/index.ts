@@ -28,6 +28,9 @@ export function httpNext(options: HttpNextOptions | HttpNextKoaFirstOptions): Ht
   if (routing === 'prefix' && (typeof apiPrefix !== 'string' || !apiPrefixPattern.test(apiPrefix))) {
     throw new TypeError('apiPrefix must contain one or more URL path segments, without a trailing slash')
   }
+  if (routing === 'koa-first' && apiPrefix !== undefined) {
+    throw new TypeError('apiPrefix can only be used with prefix routing')
+  }
 
   return async (server, handleHttp) => {
     const app = next({ dir, dev, httpServer: server })

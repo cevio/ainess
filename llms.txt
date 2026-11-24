@@ -1,0 +1,26 @@
+# Ainess
+
+> 基于 Cordis 的 TypeScript ESM 工作区。按任务选择包，读该包的 AGENTS.md 和使用手册，再通过公开入口接入。
+
+## 开发指引
+
+- [仓库工程约定和包文档规则](AGENTS.md)
+- [可安装的 ainess 技能与应用开发流程](skills/ainess/SKILL.md)
+- [工作区环境和验证命令](README.md#本地验证)
+
+## 包文档
+
+- [@ainess/framework 应用配置、Cordis 插件与入口装配、启动回滚和清理](packages/framework/README.md)
+- [@ainess/cli ainess 命令、ESM 配置加载和进程信号](packages/cli/README.md)
+- [@ainess/http Koa 中间件、HTTP 路由、Controller 目录和请求取消](packages/http/README.md)
+- [@ainess/http-next 同一监听器上的 Ainess API、Next.js 和开发态重启](packages/http-next/README.md)
+- [@ainess/model 带类型的领域方法、服务注入、目录装配和类型生成](packages/model/README.md)
+- [@ainess/typeorm 用 Cordis 管理 TypeORM DataSource、仓储和事务](packages/typeorm/README.md)
+- [@ainess/ioredis 用 Cordis 管理 Redis 单节点、Sentinel 或 Cluster](packages/ioredis/README.md)
+- [@ainess/loader 复用模块扫描、默认导出解码及文件路由解析](packages/loader/README.md)
+
+## 组合示例
+
+- [使用应用配置装配 HTTP 和 Controller 并启动监听器](README.md#通过配置启动)
+- [通过同一端口提供 Ainess API 和 Next.js 页面](packages/http-next/README.md#快速开始)
+- [在 HTTP 请求入口校验 Model 入参并调用领域方法](packages/model/README.md#从-http-调用-model)

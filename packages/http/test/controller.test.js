@@ -3,6 +3,17 @@ import test from 'node:test'
 import { defineController, http, httpListener } from '@ainess/http'
 import { Context } from '@deepseek-ai/cordis'
 
+test('rejects invalid controller handlers and schemas during declaration', () => {
+  assert.throws(() => Reflect.apply(defineController, undefined, [{ handle: 'handler' }]), {
+    name: 'TypeError',
+    message: /handle/,
+  })
+  assert.throws(() => Reflect.apply(defineController, undefined, [{ schema: {}, handle() {} }]), {
+    name: 'TypeError',
+    message: /schema/,
+  })
+})
+
 test('a controller validates once and passes the transformed input alongside the original Koa context', async (t) => {
   const app = new Context()
   t.after(() => app.fiber.dispose())

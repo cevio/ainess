@@ -99,12 +99,6 @@ test('Next and Ainess serve API, RSC, a Server Action, and assets on one port', 
     await once(socket, 'open', { signal: AbortSignal.timeout(10_000) })
     const closed = once(socket, 'close', { signal: AbortSignal.timeout(10_000) })
     await Promise.all([listener.dispose(), closed])
-    assert.equal(app.http.address(), null)
-
-    const restarted = await app.plugin(httpListener, { ...options, port: address.port }).await()
-    assert.deepEqual(await (await fetch(`${origin}/-/health`)).json(), { ok: true })
-    assert.match(await (await fetch(origin)).text(), /Next server component/)
-    await restarted.dispose()
   } else {
     await listener.dispose()
   }

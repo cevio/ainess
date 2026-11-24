@@ -1,0 +1,24 @@
+{
+  "name": "@ainess/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "files": ["dist"],
+  "bin": {
+    "ainess": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "commander": "15.1.0"
+  },
+  "peerDependencies": {
+    "@ainess/framework": "workspace:^"
+  },
+  "devDependencies": {
+    "@ainess/framework": "workspace:^",
+    "@ainess/http": "workspace:*",
+    "@deepseek-ai/cordis": "catalog:"
+  }
+}

@@ -31,6 +31,34 @@ test('scans without executing modules and imports only the selected files', asyn
   await assert.rejects(importModules(files.slice(1), value => value), /z\.handler\.mjs.*module executed/)
 })
 
+test('module scans reject malformed JavaScript extension options', async (t) => {
+  const directory = await tempDirectory(t)
+  await writeFile(join(directory, 'echo.handler.mjs'), 'export default "echo"')
+  for (const extensions of ['.mjs', [false]]) {
+    await assert.rejects(Reflect.apply(scanModules, undefined, [{ directory, suffix: 'handler', extensions }]), {
+      name: 'TypeError',
+      message: /extensions.*array of strings/,
+    })
+  }
+})
+
+test('cancelling module decoding rejects with the signal reason before the next import', async (t) => {
+  const directory = await tempDirectory(t)
+  await Promise.all([
+    writeFile(join(directory, 'a.handler.mjs'), 'export default "first"'),
+    writeFile(join(directory, 'b.handler.mjs'), 'throw new Error("unexpected next import")'),
+  ])
+  const files = await scanModules({ directory, suffix: 'handler' })
+  const controller = new AbortController()
+  const reason = new Error('loader cancelled')
+  await assert.rejects(importModules(files, async (value) => {
+    assert.equal(value, 'first')
+    await Promise.resolve()
+    controller.abort(reason)
+    return value
+  }, controller.signal), (error) => error === reason)
+})
+
 test('imports matching modules in relative path order and reuses the same API for handlers', async (t) => {
   const directory = await tempDirectory(t)
   const nested = join(directory, 'nested')

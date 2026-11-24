@@ -1,0 +1,38 @@
+{
+  "name": "@ainess/model",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./loader": {
+      "types": "./dist/loader.d.ts",
+      "default": "./dist/loader.js"
+    },
+    "./typegen": {
+      "types": "./dist/typegen.d.ts",
+      "default": "./dist/typegen.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@ainess/loader": "workspace:*",
+    "@standard-schema/spec": "1.1.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "catalog:"
+  },
+  "devDependencies": {
+    "@ainess/http": "workspace:*",
+    "@ainess/typeorm": "workspace:*",
+    "@deepseek-ai/cordis": "catalog:",
+    "sql.js": "1.17.0",
+    "typeorm": "1.1.3"
+  }
+}

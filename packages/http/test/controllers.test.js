@@ -2,10 +2,10 @@ import assert from 'node:assert/strict'
 import { EventEmitter, once } from 'node:events'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
 import { http, httpListener } from '@ainess/http'
-import { loadHttpControllers } from '@ainess/http/controllers'
+import { httpControllers, loadHttpControllers } from '@ainess/http/controllers'
 import { Context } from '@deepseek-ai/cordis'
 
 const host = '127.0.0.1'
@@ -26,6 +26,15 @@ function provideGreeting(app) {
     },
   }).await()
 }
+
+test('controller directory options reject malformed injection lists', () => {
+  for (const inject of ['models', [null], ['']]) {
+    assert.throws(() => Reflect.apply(httpControllers, undefined, [{ directory, inject }]), {
+      name: 'TypeError',
+      message: /inject/,
+    })
+  }
+})
 
 test('loads index, dynamic and catch-all controllers with the consumer’s injected services', async (t) => {
   const app = new Context()
@@ -127,6 +136,48 @@ test('HEAD falls back to GET when a file catch-all has no remaining path', async
   assert.equal((await fetch(`${url}/raw/`, { method: 'HEAD' })).status, 204)
 })
 
+test('an empty nested catch-all leaves the request available to a broader route of the same method', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'ainess-controller-nested-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  for (const name of ['[...parent]', 'images/[...nested]', '[folder]/[...dynamic]']) {
+    const filename = join(directory, `${name}.controller.mjs`)
+    await mkdir(dirname(filename), { recursive: true })
+    await writeFile(filename, `export default () => ({
+      method: 'GET',
+      middlewares: [request => { request.body = { ...request.params } }]
+    })`)
+  }
+
+  const app = new Context()
+  t.after(() => app.fiber.dispose())
+  await app.plugin(http, { router: { caseSensitive: false, ignoreDuplicateSlashes: true } }).await()
+  const options = { directory, prefix: '/files' }
+  const wildcard = '/FILES/:category//*'
+  const removeExplicit = app.http.route('GET', wildcard, () => {})
+  await assert.rejects(loadHttpControllers(app, options), /already declared/)
+  await removeExplicit()
+  const routes = await app.plugin(httpControllers(options)).await()
+  assert.throws(() => app.http.route('GET', wildcard, () => {}), /already declared/)
+  await app.plugin(httpListener, { host, port: 0 }).await()
+
+  const url = origin(app)
+  assert.deepEqual(await (await fetch(`${url}/files/images/logo`)).json(), { nested: 'logo' })
+  assert.deepEqual(await (await fetch(`${url}/files/documents/draft`)).json(), {
+    folder: 'documents', dynamic: 'draft',
+  })
+  const parent = await fetch(`${url}/files/images/`)
+  assert.equal(parent.status, 200)
+  assert.deepEqual(await parent.json(), { parent: 'images/' })
+  assert.deepEqual(await (await fetch(`${url}/FILES/Images//`)).json(), { parent: 'Images/' })
+  const root = await fetch(`${url}/files/`)
+  assert.equal(root.status, 404)
+  await root.text()
+
+  await routes.dispose()
+  app.http.route('GET', wildcard, (request) => { request.body = { ...request.params } })
+  assert.deepEqual(await (await fetch(`${url}/files/images/`)).json(), { category: 'images', '*': '' })
+})
+
 test('a conflict rolls back the directory and allows a retry after removing the existing route', async (t) => {
   const app = new Context()
   t.after(() => app.fiber.dispose())
@@ -183,8 +234,44 @@ test('rejects a promise returned by a controller factory without leaking a rejec
   await assert.rejects(loadHttpControllers(app, { directory }), /index\.controller\.mjs.*synchronous/)
 })
 
+test('stops the controller batch when a factory disposes its own scope', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'ainess-controller-dispose-factory-'))
+  const app = new Context()
+  t.after(async () => {
+    await app.fiber.dispose()
+    await rm(directory, { recursive: true, force: true })
+  })
+  const recordFactory = t.mock.fn()
+  app.provide('recordFactory', recordFactory)
+  await Promise.all([
+    writeFile(join(directory, 'a.controller.mjs'), `export default ctx => {
+      ctx.recordFactory('first')
+      void ctx.fiber.dispose()
+      return { method: 'GET', middlewares: [request => { request.body = 'first' }] }
+    }`),
+    writeFile(join(directory, 'b.controller.mjs'), `export default ctx => {
+      ctx.recordFactory('second')
+      return { method: 'GET', middlewares: [request => { request.body = 'second' }] }
+    }`),
+  ])
+  await app.plugin(http).await()
+  await app.plugin(httpListener, { host, port: 0 }).await()
+  const routes = await app.plugin({
+    inject: ['http', 'recordFactory'],
+    apply(ctx) {
+      return loadHttpControllers(ctx, { directory })
+    },
+  }).await()
+
+  assert.equal(routes.uid, null)
+  assert.deepEqual(recordFactory.mock.calls.map(call => call.arguments), [['first']])
+  const missing = await fetch(`${origin(app)}/a`)
+  assert.equal(missing.status, 404)
+  await missing.text()
+})
+
 for (const owner of ['controller', 'dependency']) {
-  test(`disposing the ${owner} during a module import skips controller registration`, {
+  test(`disposing the ${owner} during a module import skips later imports and routes`, {
     timeout: 5_000,
   }, async (t) => {
     const directory = await mkdtemp(join(tmpdir(), 'ainess-controller-dispose-'))
@@ -192,7 +279,9 @@ for (const owner of ['controller', 'dependency']) {
     const gate = new EventEmitter()
     Reflect.set(globalThis, key, gate)
     const factory = t.mock.fn()
+    const laterImport = t.mock.fn()
     gate.on('factory', factory)
+    gate.on('later-import', laterImport)
     const app = new Context()
     t.after(async () => {
       gate.emit('continue')
@@ -212,6 +301,10 @@ for (const owner of ['controller', 'dependency']) {
         return { method: 'GET', middlewares: [request => { request.body = 'loaded' }] }
       }
     `)
+    await writeFile(join(directory, 'later.controller.mjs'), `
+      Reflect.get(globalThis, ${JSON.stringify(key)}).emit('later-import')
+      export default () => ({ method: 'GET', middlewares: [() => {}] })
+    `)
     await app.plugin(http).await()
     const dependency = await provideGreeting(app)
     await app.plugin(httpListener, { host, port: 0 }).await()
@@ -227,6 +320,7 @@ for (const owner of ['controller', 'dependency']) {
     gate.emit('continue')
     await disposed
     await routes.await()
+    assert.equal(laterImport.mock.callCount(), 0)
     assert.equal(factory.mock.callCount(), 0)
     const missing = await fetch(origin(app))
     assert.equal(missing.status, 404)

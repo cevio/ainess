@@ -25,6 +25,10 @@ export function defineController<Input>(
   controller: ControllerHandler<HttpControllerInput> | HttpControllerOptions<Input> | UnvalidatedControllerOptions,
 ): HttpRouteMiddleware {
   const options = 'handle' in controller ? controller : { handle: controller, schema: undefined }
+  if (typeof options.handle !== 'function') throw new TypeError('Controller handle must be a function')
+  if (options.schema !== undefined && typeof options.schema?.['~standard']?.validate !== 'function') {
+    throw new TypeError('Controller schema must provide Standard Schema validation')
+  }
   return async (request) => {
     const { body } = request.request as typeof request.request & { body?: unknown }
     const input: HttpControllerInput = { params: request.params, query: request.query, body }
