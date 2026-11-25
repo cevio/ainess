@@ -25,7 +25,7 @@ export const MAX_BODY = 64 * 1024
 export const MAX_CALLS = 4096
 export const EMPTY = Buffer.alloc(0)
 
-export function encodeHeader(frame: Frame, header = Buffer.allocUnsafe(HEADER_SIZE)): Buffer {
+export function encodeHeader(frame: Frame, header: Buffer = Buffer.allocUnsafe(HEADER_SIZE)): Buffer {
   if (frame.body.length > MAX_BODY) throw new RangeError('RPC frame body exceeds the size limit')
   header.writeUInt32BE(frame.body.length, 0)
   header.writeUInt32BE(frame.id, 4)

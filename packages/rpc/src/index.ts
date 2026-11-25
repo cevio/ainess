@@ -9,6 +9,8 @@ export type {
   RpcAddress,
   RpcCall,
   RpcCallOptions,
+  RpcCloseInfo,
+  RpcCloseReason,
   RpcErrorCode,
   RpcInput,
   RpcMethod,

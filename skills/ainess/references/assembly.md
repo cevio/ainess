@@ -234,3 +234,5 @@ try {
 ```
 
 运行 `node rpc.mjs` 会输出 `hello`。`app.start()` 等待 RPC 监听就绪，`RpcPeer.connect()` 等待握手，监听端在分派首个入站调用前执行 `onPeer`。问候处理函数通过上下文的 `peer` 反向调用 `demo.message`，并用 `signal` 传递取消信号。长期使用的端点由其调用方或创建它的插件复用并在退出时关闭。 [同连接反向调用与双向流](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#快速开始)
+
+插件若维护活跃连接表，可在 `onPeer` 中记录端点，并用 `peer.onClose(() => { peers.delete(peer) })` 在关闭时移除。拨号端可以用同一个接口接收异步关闭通知，按 `reason` 处理本端关闭、对端正常关闭和错误，并在应用层安排重连。 [连接保活和关闭通知](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#连接保活和关闭通知)

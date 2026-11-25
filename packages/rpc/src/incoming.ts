@@ -1,3 +1,4 @@
+import { isUint8Array } from 'node:util/types'
 import { byteBody, errorFrame, frame, invalidProtocol, readOpenBody } from './messages.js'
 import type { MethodRegistry, RegisteredMethod } from './methods.js'
 import type { MessageModem } from './modem.js'
@@ -96,7 +97,7 @@ export class IncomingCalls {
       const response = method.mode === RpcMode.ClientStream || method.mode === RpcMode.Bidi
         ? method.handle({ ...context, input: call.input! })
         : method.handle(context)
-      const result = response instanceof Uint8Array ? response : await response
+      const result = isUint8Array(response) ? response : await response
       if (method.mode === RpcMode.ServerStream || method.mode === RpcMode.Bidi) {
         if (!result || !(Symbol.asyncIterator in result)) {
           throw new RpcError('INTERNAL', 'RPC method must return an async iterable of bytes')
@@ -106,7 +107,7 @@ export class IncomingCalls {
         })
         if (!signal.aborted) await this.modem.send(frame(FrameType.End, id))
       } else if (!signal.aborted) {
-        if (!(result instanceof Uint8Array)) throw new RpcError('INTERNAL', 'RPC method must return bytes')
+        if (!isUint8Array(result)) throw new RpcError('INTERNAL', 'RPC method must return bytes')
         const reply = frame(FrameType.End, id, byteBody(result))
         if (!this.modem.trySend(reply)) await this.modem.send(reply)
       }

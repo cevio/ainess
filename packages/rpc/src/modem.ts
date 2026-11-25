@@ -3,6 +3,7 @@ import { deferred } from './deferred.js'
 import type { Deferred } from './deferred.js'
 import { frame, invalidProtocol } from './messages.js'
 import { RpcError } from './types.js'
+import type { RpcCloseReason } from './types.js'
 import {
   decodeHello, encodeHeader, encodeHello, FrameDecoder, FrameType, HEADER_SIZE, LIMITS, MAX_BODY, MAX_CALLS, writeUint32,
 } from './wire.js'
@@ -36,6 +37,8 @@ const NO_RELEASE = () => {}
 const CALL_FINISHED = new RpcError('CANCELLED', 'RPC call finished')
 const CREDIT_INTERVAL_MS = 1
 const MAX_INLINE_BODY = 4 * 1024
+const KEEP_ALIVE_INITIAL_DELAY_MS = 30_000
+const MAX_FRAME_SIZE = HEADER_SIZE + MAX_BODY
 
 export function resolveCallLimit(limit = LIMITS.maxCalls): number {
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_CALLS) {
@@ -88,6 +91,7 @@ export class MessageModem {
   #receiveData = window(0, 1, LIMITS.streamWindow)
   #sendShort = 0
   #sendData = 0
+  #replyReserve = 0
   #credits = new Set<ReceiveWindow>()
   #creditTimer: NodeJS.Timeout | undefined
   #control = new Set<Pending>()
@@ -104,7 +108,7 @@ export class MessageModem {
     private readonly socket: Socket,
     role: 'dialer' | 'acceptor',
     private readonly receive: Receive,
-    private readonly onClose: (error: RpcError) => void,
+    private readonly onClose: (error: RpcError, reason: RpcCloseReason) => void,
     private readonly onReady?: () => void,
     readonly maxIncomingCalls = LIMITS.maxCalls,
   ) {
@@ -113,6 +117,7 @@ export class MessageModem {
     this.#handshake = setTimeout(() => this.close(new RpcError('UNAVAILABLE', 'RPC handshake timed out')), 10_000)
     this.#handshake.unref()
     void this.#ready.promise.catch(NO_RELEASE)
+    socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY_MS)
     socket.setNoDelay(true)
     socket.on('data', bytes => {
       try {
@@ -135,10 +140,11 @@ export class MessageModem {
     })
     socket.on('error', cause => this.close(new RpcError('UNAVAILABLE', cause.message, { cause })))
     socket.on('end', () => {
-      this.close(new RpcError('UNAVAILABLE', this.#decoder.incomplete ? 'Truncated RPC frame' : 'RPC peer disconnected'))
+      if (this.#decoder.incomplete) this.close(new RpcError('UNAVAILABLE', 'Truncated RPC frame'))
+      else this.close(new RpcError('UNAVAILABLE', 'RPC peer disconnected'), 'remote')
     })
     socket.once('close', () => {
-      this.close()
+      if (!this.#reason) this.close(new RpcError('UNAVAILABLE', 'RPC peer disconnected'), 'remote')
       this.#closed.resolve()
     })
     this.#write(frame(FrameType.Hello, 0, encodeHello(maxIncomingCalls)))
@@ -218,7 +224,9 @@ export class MessageModem {
       this.#sendShort -= bytes
     } else if (channel === 'data') {
       const call = this.#calls.get(value.id)
-      if (!call || this.#short.size || this.#data.size || bytes > this.#sendData || bytes > call.outgoing) return false
+      if (!call || this.#short.size || this.#data.size || bytes > call.outgoing) return false
+      const available = this.#sendData - (this.isLocal(value.id) ? this.#replyReserve : 0)
+      if (bytes > available) return false
       this.#sendData -= bytes
       call.outgoing -= bytes
     }
@@ -257,8 +265,9 @@ export class MessageModem {
     if (!this.trySend(value, true)) return this.send(value)
   }
 
-  close(error = new RpcError('UNAVAILABLE', 'RPC connection closed')): Promise<void> {
+  close(error?: RpcError, reason: RpcCloseReason = error ? 'error' : 'local'): Promise<void> {
     if (this.#reason) return this.#closed.promise
+    error ??= new RpcError('UNAVAILABLE', 'RPC connection closed')
     this.#reason = error
     clearTimeout(this.#handshake)
     clearTimeout(this.#creditTimer)
@@ -272,7 +281,7 @@ export class MessageModem {
     this.#data.clear()
     this.#credits.clear()
     this.#calls.clear()
-    this.onClose(error)
+    this.onClose(error, reason)
     return this.#closed.promise
   }
 
@@ -282,6 +291,7 @@ export class MessageModem {
       this.#peer = decodeHello(value.body)
       this.#sendShort = this.#peer.messageWindow
       this.#sendData = this.#peer.streamWindow
+      this.#replyReserve = Math.min(MAX_FRAME_SIZE, this.#sendData - MAX_FRAME_SIZE)
       clearTimeout(this.#handshake)
       this.onReady?.()
       this.#ready.resolve()
@@ -344,7 +354,7 @@ export class MessageModem {
     if (short && incoming.available >= LIMITS.messageWindow * 3 / 4) return
     const pending = this.#credits.size > 0
     this.#credits.add(incoming)
-    if (short || incoming.owed >= incoming.batchThreshold || incoming.available < MAX_BODY + HEADER_SIZE) {
+    if (short || incoming.owed >= incoming.batchThreshold || incoming.available < MAX_FRAME_SIZE) {
       if (!pending || this.#creditTimer) {
         clearTimeout(this.#creditTimer)
         this.#creditTimer = undefined
@@ -415,13 +425,21 @@ export class MessageModem {
   }
 
   #flushData(): void {
+    let uploadsBlocked = false
     for (const [id, pending] of this.#data) {
       if (!this.#writable) break
       const call = this.#calls.get(id)!
       const bytes = HEADER_SIZE + pending.frame.body.length
       if (bytes > call.outgoing) continue
-      // Let shared credit accumulate for the oldest eligible frame.
-      if (bytes > this.#sendData) break
+      if (this.isLocal(id)) {
+        // Keep enough credit for a reply even when uploads on both peers fill their windows.
+        if (uploadsBlocked || bytes > this.#sendData - this.#replyReserve) {
+          uploadsBlocked = true
+          continue
+        }
+      } else if (bytes > this.#sendData) {
+        break
+      }
       this.#data.delete(id)
       this.#sendData -= bytes
       call.outgoing -= bytes
@@ -441,12 +459,10 @@ export class MessageModem {
   }
 
   #write(value: Frame, batch = false): void {
-    if (value.packet || value.body.length <= MAX_INLINE_BODY) {
-      let bytes = value.packet
-      if (!bytes) {
-        bytes = encodeHeader(value, Buffer.allocUnsafe(HEADER_SIZE + value.body.length))
-        bytes.set(value.body, HEADER_SIZE)
-      }
+    const packet = value.packet
+    if (packet || value.body.length <= MAX_INLINE_BODY) {
+      const bytes = encodeHeader(value, packet ?? Buffer.allocUnsafe(HEADER_SIZE + value.body.length))
+      if (!packet) bytes.set(value.body, HEADER_SIZE)
       if (batch && !this.socket.writableCorked) {
         this.socket.cork()
         process.nextTick(this.#uncork)

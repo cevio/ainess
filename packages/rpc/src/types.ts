@@ -15,6 +15,13 @@ export interface RpcAddress {
   port: number
 }
 
+export type RpcCloseReason = 'local' | 'remote' | 'error'
+
+export interface RpcCloseInfo {
+  readonly reason: RpcCloseReason
+  readonly error: RpcError
+}
+
 export interface RpcCallOptions {
   input?: (signal: AbortSignal) => ByteStream
   signal?: AbortSignal

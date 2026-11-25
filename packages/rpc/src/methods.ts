@@ -7,10 +7,12 @@ import type { RpcMethod } from './types.js'
 export type RegisteredMethod = RpcMethod & {
   active: number
   drained?: Deferred<void>
+  unregister: () => Promise<void>
 }
 
 export class MethodRegistry {
   #methods = new Map<string, RegisteredMethod>()
+  #closed = false
 
   get(name: string): RegisteredMethod | undefined {
     return this.#methods.get(name)
@@ -19,28 +21,40 @@ export class MethodRegistry {
   register(method: RpcMethod): () => Promise<void> {
     const { name, mode, handle } = method
     methodNameLength(name)
-    if (this.#methods.has(name)) throw new RpcError('INVALID_ARGUMENT', 'Duplicate RPC method name')
+    this.#checkRegistration(name)
     if (!Number.isInteger(mode) || mode < RpcMode.Unary || mode > RpcMode.Bidi || typeof handle !== 'function') {
       throw new RpcError('INVALID_ARGUMENT', 'Invalid RPC method definition')
     }
-    const registration: RegisteredMethod = {
-      name,
-      mode,
-      handle: Function.prototype.bind.call(handle, method),
-      active: 0,
-    }
-    this.#methods.set(name, registration)
+    const bound = Function.prototype.bind.call(handle, method)
+    // Binding can run user code that synchronously closes or changes the registry.
+    this.#checkRegistration(name)
+
+    let methods: Map<string, RegisteredMethod> | undefined = this.#methods
+    let registration: RegisteredMethod | undefined
     let removed: Promise<void> | undefined
-    return () => {
+    const unregister = () => {
       if (removed) return removed
-      if (this.#methods.get(name) === registration) this.#methods.delete(name)
-      if (registration.active === 0) return removed = Promise.resolve()
-      registration.drained = deferred<void>()
-      return removed = registration.drained.promise
+      methods?.delete(name)
+      methods = undefined
+      const active = registration
+      registration = undefined
+      if (!active?.active) return removed = Promise.resolve()
+      active.drained = deferred<void>()
+      return removed = active.drained.promise
     }
+    const entry: RegisteredMethod = { name, mode, handle: bound, active: 0, unregister }
+    registration = entry
+    methods.set(name, entry)
+    return unregister
   }
 
   clear(): void {
-    this.#methods.clear()
+    this.#closed = true
+    for (const method of this.#methods.values()) void method.unregister()
+  }
+
+  #checkRegistration(name: string): void {
+    if (this.#closed) throw new RpcError('UNAVAILABLE', 'RPC method registry is closed')
+    if (this.#methods.has(name)) throw new RpcError('INVALID_ARGUMENT', 'Duplicate RPC method name')
   }
 }

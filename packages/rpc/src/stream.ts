@@ -1,6 +1,6 @@
-import { addAbortListener } from 'node:events'
+import { observeAbort } from './abort.js'
 import type { Bytes, ByteStream } from './types.js'
-import { HEADER_SIZE } from './wire.js'
+import { EMPTY, HEADER_SIZE } from './wire.js'
 
 const END: IteratorReturnResult<undefined> = Object.freeze({ done: true, value: undefined })
 
@@ -20,7 +20,7 @@ export class IncomingStream implements AsyncIterableIterator<Bytes> {
   #consumer: Consumer | undefined
   #terminal: typeof END | Error | undefined
 
-  constructor(private readonly onStop: () => void) {}
+  constructor(private onStop?: () => void) {}
 
   [Symbol.asyncIterator](): this {
     return this
@@ -54,11 +54,17 @@ export class IncomingStream implements AsyncIterableIterator<Bytes> {
     return Promise.resolve(END)
   }
 
+  setOnStop(onStop: () => void): void {
+    // Returning the iterator can happen inside synchronous call startup.
+    if (this.#terminal === END) onStop()
+    else if (!this.#terminal) this.onStop = onStop
+  }
+
   stop(): void {
-    const notify = !this.#terminal
+    const onStop = this.onStop
     this.#finish(END)
     this.#discard()
-    if (notify) this.onStop()
+    onStop?.()
   }
 
   push(bytes: Bytes, release: () => void): void {
@@ -66,6 +72,7 @@ export class IncomingStream implements AsyncIterableIterator<Bytes> {
       release()
       return
     }
+    if (bytes === EMPTY) bytes = Buffer.alloc(0)
     const consumer = this.#consumer
     if (!consumer) {
       // Bound the backing storage of a queued view relative to its flow-control charge.
@@ -100,6 +107,7 @@ export class IncomingStream implements AsyncIterableIterator<Bytes> {
 
   #finish(terminal: typeof END | Error): void {
     this.#terminal = terminal
+    this.onStop = undefined
     const consumer = this.#consumer
     this.#consumer = undefined
     if (terminal === END) consumer?.resolve(END)
@@ -127,8 +135,9 @@ export async function pump(
     })
   }
 
-  const abortListener = addAbortListener(signal, abort)
+  let stopObserving: (() => void) | undefined
   try {
+    stopObserving = observeAbort(signal, abort)
     while (!signal.aborted) {
       const result = await untilAbort(iterator.next())
       if (!result || signal.aborted) break
@@ -142,7 +151,7 @@ export async function pump(
   } catch (error) {
     if (!signal.aborted) throw error
   } finally {
-    abortListener[Symbol.dispose]()
+    stopObserving?.()
     if (!completed) {
       try {
         const cleanup = Promise.resolve(iterator.return?.()).catch(() => {})

@@ -65,13 +65,16 @@ try {
 | `peer.register({ name, mode, handle })` | 注册该端点的连接专属方法，返回注销函数 `() => Promise<void>`。 |
 | `peer.request(name, options?)` 或 `peer.request(name, data, options?)` | 按方法名立即发起调用，返回 `Promise<Uint8Array>`。 |
 | `peer.stream(name, options?)` 或 `peer.stream(name, data, options?)` | 返回一次性 `AsyncIterableIterator<Uint8Array>`，在首次读取时按方法名发起调用。 |
+| `peer.onClose(listener)` | 订阅该端点的关闭通知，监听器接收 `RpcCloseInfo`。返回取消订阅函数 `() => void`。 |
 | `peer.close()`、`server.close()` | 返回 `Promise<void>`。端点关闭当前连接，服务端关闭监听和接入连接，相关在途调用一并终止。可重复调用。 |
 
 ### 注册与注销方法
 
 每个方法包含 `{ name, mode, handle }`。方法名区分大小写，支持中文等 Unicode 字符，UTF-8 编码必须为 1 至 255 字节。空字符串、超过字节上限、包含非法 Unicode 或与同一注册表中的方法重名时，注册抛出 `INVALID_ARGUMENT`。预注册列表遵循相同规则。端点或监听器开始关闭后，其 `register()` 抛出 `UNAVAILABLE`。
 
-接入端收到调用时，优先查找当前连接的专属方法，再查找监听器共享方法。拨号端通过自己的连接注册表提供方法。调用注销函数会立即移除该注册，并等待它已接收的调用退出，包括处理函数和响应流的清理。可重复调用同一个注销函数。旧方法等待清理时可以注册同名新方法，已接收的调用继续使用原来的处理函数。查找不到方法时，后续调用返回 `NOT_FOUND`。连接可以继续复用。
+接入端收到调用时，优先查找当前连接的专属方法，再查找监听器共享方法。拨号端通过自己的连接注册表提供方法。调用注销函数会立即移除该注册，并等待它已接收的调用退出，包括处理函数和响应流的清理。可重复调用同一个注销函数，端点或监听器关闭后也可用它等待清理。旧方法等待清理时可以注册同名新方法，已接收的调用继续使用原来的处理函数。
+
+查找不到方法时，调用方收到 `RpcError`，其 `code` 为 `NOT_FOUND`。调用模式与注册的方法不匹配时，`code` 为 `INVALID_ARGUMENT`。这两类错误只结束当前调用，连接可以继续复用。
 
 处理函数接收 `{ data, signal, peer }`，流式输入时另有 `input`。用上下文的 `peer` 发起反向调用会复用当前 TCP 连接。单响应处理函数返回 `Uint8Array`，流式响应处理函数返回 `AsyncIterable<Uint8Array>`。两种返回值都可以通过 Promise 提供。
 
@@ -84,17 +87,61 @@ try {
 | `ServerStream` | `0b10` | `stream('demo.list')` |
 | `Bidi` | `0b11` | `stream('demo.chat', { input })` |
 
-`data` 是调用开始时送达的请求数据或元数据。省略 `data` 或显式传入 `undefined` 时，服务端收到长度为 0 的 `Uint8Array`。需要同时传数据和选项时，可用 `request(name, data, { timeoutMs: 5_000 })`。所有业务数据和流元素都是 `Uint8Array`。包可以直接使用调用方交付的缓冲区。传入、返回或 `yield` 后按只读处理，已收到的字节可以在后续读取后继续使用。
+`data` 是调用开始时送达的请求数据或元数据。省略 `data` 或显式传入 `undefined` 时，服务端收到长度为 0 的 `Uint8Array`。需要同时传数据和选项时，可用 `request(name, data, { timeoutMs: 5_000 })`。所有业务数据和流元素都是 `Uint8Array`，也可使用在其他 JavaScript 上下文中创建的实例。直接把 `ArrayBuffer` 或 `SharedArrayBuffer` 当作请求数据，或传入因内存转移或缩容而失效的视图时，该调用返回 `INVALID_ARGUMENT`。
+
+传输以视图的实际偏移和长度为准，包可以直接使用调用方交付的缓冲区。传入、返回或 `yield` 后按只读处理，已收到的字节可以在后续读取后继续使用。需要转移收到数据的底层内存时，先复制到新的 `Uint8Array`。
 
 `options.input` 接收上传方向独立的 `AbortSignal`，返回按需读取的异步可迭代对象。自然耗尽只关闭上传方向。处理方调用 `input.stop()` 或提前结束输入迭代时，RPC 会终止上传并中止上传源的信号，响应可以继续。文件或其他等待中的读操作应监听该信号。
 
+接收输入流或响应流时，每个迭代器最多允许一个等待中的 `next()`。使用 `for await...of` 会逐项读取。
+
 `options.signal` 中止整个调用，`options.timeoutMs` 接受 1 至 2,147,483,647 的整数，省略时不限时。流式调用的时限从首次读取时开始。调用方提前结束响应迭代时也会取消整个调用。网络断开或调用失败时，单响应 Promise 拒绝，流在读到失败时抛出错误。调用方可从 `RpcError.code` 获取错误代码。处理函数可抛出 `new RpcError(code, message?, options?)` 指定错误码。应用自行决定是否重试，超时或断线时对端可能已经执行了方法。
 
-包还导出 `Bytes`、`ByteStream`、`RpcAddress`、`RpcPeerOptions`、`RpcServerOptions`、`RpcCallOptions`、`RpcCall`、`RpcInput`、`RpcStreamingCall`、`RpcMethod` 和 `RpcErrorCode` 类型。
+包还导出 `Bytes`、`ByteStream`、`RpcAddress`、`RpcPeerOptions`、`RpcServerOptions`、`RpcCallOptions`、`RpcCall`、`RpcInput`、`RpcStreamingCall`、`RpcMethod`、`RpcErrorCode`、`RpcCloseInfo` 和 `RpcCloseReason` 类型。
 
 同一个连接可以并发承载两个方向的调用。应用在卸载时关闭自己创建的拨号端点和监听器。需要关闭服务端已接入的某一条连接时，可以调用该连接的 `peer.close()`。如果在 Cordis 中创建连接，由创建资源的插件注册清理，并等待监听或握手完成后再提供给消费者。
 
 `maxConcurrentCalls` 默认 `256`，接受 `1` 至 `4096` 的整数，设置不合法时返回 `INVALID_ARGUMENT`。本端用它限制每条连接上的入站并发调用数，并通过 `HELLO` 公布该上限。发起调用时，出站并发上限取本端设置与对端公布的入站上限中的较小值。要在同一方向发起超过 `256` 个并发调用，两端都要提高该设置。达到上限时调用返回 `RESOURCE_EXHAUSTED`。
+
+### 连接保活和关闭通知
+
+拨号端和接入端都启用 TCP KeepAlive，连接空闲 30 秒后由操作系统发送首次探测。实际发现断线的时间还取决于操作系统的探测间隔和次数。KeepAlive 探测 TCP 连接，调用方可通过 `timeoutMs` 限制等待 RPC 响应的时间。应用负责决定是否重连。 [Node.js TCP KeepAlive](https://nodejs.org/api/net.html#socketsetkeepalive)
+
+`peer.onClose(listener)` 在端点开始关闭并终止在途调用后异步通知，每个订阅最多收到一次。关闭后订阅也会异步收到该端点的最终通知。回调执行前可以取消订阅。监听器抛出异常或返回拒绝的 Promise 时，其他监听器仍会收到通知。
+
+`RpcCloseInfo` 提供只读的 `reason` 和 `error` 两个字段。 `error` 是用于结束在途调用的 `RpcError`。 `reason` 以当前端点的视角说明关闭原因。
+
+| `RpcCloseReason` | 含义 |
+| --- | --- |
+| `'local'` | 本端主动关闭，包括监听器关闭其接入端点。 |
+| `'remote'` | 收到对端正常结束 TCP 连接的通知。 |
+| `'error'` | TCP 传输、RPC 协议或端点运行出现错误。 |
+
+下面的示例在接入端跟踪活跃连接，在拨号端记录关闭原因。
+
+```js
+import { RpcPeer, RpcServer } from '@ainess/rpc'
+
+const peers = new Set()
+const server = await RpcServer.listen({
+  host: '127.0.0.1',
+  port: 0,
+  onPeer(peer) {
+    peers.add(peer)
+    peer.onClose(() => { peers.delete(peer) })
+  },
+})
+
+try {
+  const peer = await RpcPeer.connect(server.address)
+  peer.onClose(({ reason, error }) => {
+    console.log('连接关闭', reason, error.code)
+  })
+  await peer.close()
+} finally {
+  await server.close()
+}
+```
 
 ## 传输协议
 
@@ -135,7 +182,9 @@ try {
 
 各端的连接级接收窗口由这条连接上的调用共享。`OPEN` 和携带消息体的 `END` 占用短消息额度，剩余额度低于短消息窗口的四分之三时批量补回。`DATA` 同时占用连接级流式额度和单调用流式额度，包括帧头在内按字节计算。收端消费数据后累积待归还的流式额度。累积达到窗口的一半或剩余额度不足一个最大帧时尽快发送额度更新，其余情况使用 1 毫秒的定时器合并更新。`WINDOW_UPDATE` 携带一个 `u32` 增量。调用 ID 为 0 时，标志 0 归还短消息额度，标志 1 归还连接级流式额度。非零调用 ID 配合标志 0 归还对应调用的流式额度。
 
-TCP 读写高水位均为 262,192 字节，发送端按写入背压暂停和恢复。`OPEN` 一次编码成包含帧头和帧体的缓冲区。其他帧在帧体不超过 4 KiB 时也合入同一个写缓冲，更大的帧分开提交帧头和帧体。并发小帧可在同一事件循环批量写出。排队等待消费的 `DATA` 若引用超过其计费字节数四倍的接收缓冲，会复制到独立缓冲区，以限制队列保留的内存。
+发送端从连接级流式额度中为响应保留最多一个最大帧的空间，保留后的窗口仍可容纳一个最大上传帧。上传因共享额度不足而排队时，能发送的响应可以先发。这让双方同时上传时，仍有空间发送响应并继续处理输入。响应持续占满可用额度时，上传需要等待共享额度累积。
+
+TCP 读写高水位均为 262,192 字节，发送端按写入背压暂停和恢复。`OPEN` 先准备帧体，再分配调用 ID，发送时将帧头写入同一缓冲区。其他帧在帧体不超过 4 KiB 时也合入同一个写缓冲，更大的帧分开提交帧头和帧体。并发小帧可在同一事件循环批量写出。排队等待消费的 `DATA` 若引用超过其计费字节数四倍的接收缓冲，会复制到独立缓冲区，以限制队列保留的内存。
 
 `ERROR` 消息体先写 `u16` 错误码，再写最多 1,024 字节的 UTF-8 消息。错误码 1 至 7 依次对应 `CANCELLED`、`DEADLINE_EXCEEDED`、`INVALID_ARGUMENT`、`NOT_FOUND`、`RESOURCE_EXHAUSTED`、`UNAVAILABLE` 和 `INTERNAL`。
 

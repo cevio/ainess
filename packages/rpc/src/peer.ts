@@ -1,12 +1,12 @@
-import { addAbortListener } from 'node:events'
 import { createConnection } from 'node:net'
 import type { Socket } from 'node:net'
+import { observeAbort } from './abort.js'
 import { IncomingCalls } from './incoming.js'
 import { MethodRegistry } from './methods.js'
 import { MessageModem, resolveCallLimit } from './modem.js'
 import { OutgoingCalls } from './outgoing.js'
 import { RpcError } from './types.js'
-import type { Bytes, RpcAddress, RpcCallOptions, RpcMethod } from './types.js'
+import type { Bytes, RpcAddress, RpcCallOptions, RpcCloseInfo, RpcCloseReason, RpcMethod } from './types.js'
 import { LIMITS } from './wire.js'
 
 export interface RpcPeerOptions {
@@ -23,6 +23,8 @@ export class RpcPeer {
   #modem: MessageModem
   #incoming: IncomingCalls
   #outgoing: OutgoingCalls
+  #closeInfo: RpcCloseInfo | undefined
+  #closeListeners: Set<(info: RpcCloseInfo) => void> | undefined
 
   private constructor(
     socket: Socket,
@@ -36,11 +38,12 @@ export class RpcPeer {
     this.#modem = new MessageModem(socket, role, (frame, release) => {
       const calls = this.#modem.isLocal(frame.id) ? this.#outgoing : this.#incoming
       calls.receive(frame, release)
-    }, error => {
+    }, (error, reason) => {
       this.methods.clear()
       this.#outgoing.closed(error)
       this.#incoming.closed(error)
       onClose?.()
+      this.#notifyClose(error, reason)
     }, onPeer && (() => this.#notify(onPeer)), maxCalls)
     this.#incoming = new IncomingCalls(this.#modem, this, methods, sharedMethods)
     this.#outgoing = new OutgoingCalls(this.#modem)
@@ -56,9 +59,11 @@ export class RpcPeer {
     const socketOptions = { host: address.host, port: address.port, highWaterMark: LIMITS.callWindow }
     const socket = createConnection(socketOptions)
     const peer = new RpcPeer(socket, 'dialer', methods, maxCalls)
-    let abort: Disposable | undefined
+    let disposeAbort: (() => void) | undefined
     try {
-      if (signal) abort = addAbortListener(signal, () => { void peer.#modem.close(cancelled()) })
+      if (signal) disposeAbort = observeAbort(signal, () => {
+        void peer.#modem.close(cancelled(), 'local')
+      })
       await peer.#modem.ready
       if (signal?.aborted) throw cancelled()
       if (peer.#modem.failure) throw peer.#modem.failure
@@ -67,7 +72,7 @@ export class RpcPeer {
       await peer.close()
       throw error
     } finally {
-      abort?.[Symbol.dispose]()
+      disposeAbort?.()
     }
   }
 
@@ -99,8 +104,39 @@ export class RpcPeer {
     return this.#outgoing.stream(name, dataOrOptions, options)
   }
 
+  onClose(listener: (info: RpcCloseInfo) => void): () => void {
+    const closed = this.#closeInfo
+    let listeners = closed ? undefined : (this.#closeListeners ??= new Set())
+    let subscribed: typeof listener | undefined = listener
+    const notify = (info: RpcCloseInfo) => {
+      listeners = undefined
+      void Promise.resolve().then(() => {
+        const callback = subscribed
+        subscribed = undefined
+        return callback?.(info)
+      }).catch(() => {})
+    }
+    listeners?.add(notify)
+    if (closed) notify(closed)
+
+    return () => {
+      subscribed = undefined
+      listeners?.delete(notify)
+      listeners = undefined
+    }
+  }
+
   close(): Promise<void> {
     return this.#modem.close()
+  }
+
+  #notifyClose(error: RpcError, reason: RpcCloseReason): void {
+    const info = Object.freeze({ error, reason })
+    this.#closeInfo = info
+    const listeners = this.#closeListeners
+    this.#closeListeners = undefined
+    if (!listeners) return
+    for (const notify of listeners) notify(info)
   }
 
   #notify(onPeer: (peer: RpcPeer) => void): void {

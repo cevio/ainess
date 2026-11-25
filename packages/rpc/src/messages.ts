@@ -1,7 +1,8 @@
 import { Buffer, isUtf8 } from 'node:buffer'
+import { isUint8Array } from 'node:util/types'
 import { RpcError } from './types.js'
 import type { Bytes, RpcErrorCode } from './types.js'
-import { EMPTY, encodeHeader, FrameType, HEADER_SIZE, MAX_BODY } from './wire.js'
+import { EMPTY, FrameType, HEADER_SIZE, MAX_BODY } from './wire.js'
 import type { Frame } from './wire.js'
 
 const errorCodes = [
@@ -14,6 +15,12 @@ const errorCodes = [
   'INTERNAL',
 ] as const satisfies readonly RpcErrorCode[]
 
+const typedArray = Object.getPrototypeOf(Uint8Array.prototype)
+const viewBuffer = Object.getOwnPropertyDescriptor(typedArray, 'buffer')!.get!
+const viewOffset = Object.getOwnPropertyDescriptor(typedArray, 'byteOffset')!.get!
+const viewLength = Object.getOwnPropertyDescriptor(typedArray, 'byteLength')!.get!
+const setBytes = Uint8Array.prototype.set
+
 export function frame(type: FrameType, id: number, body: Buffer = EMPTY, flags = 0): Frame {
   return { type, id, body, flags }
 }
@@ -23,10 +30,33 @@ export function invalidProtocol(message: string): never {
 }
 
 export function byteBody(data: Bytes, prefix = 0): Buffer {
-  if (!(data instanceof Uint8Array) || data.byteLength > MAX_BODY - prefix) {
+  if (data === EMPTY) return EMPTY
+  const isBytes = isUint8Array(data)
+  // Ordinary Buffers already expose the correct view to the socket.
+  const standardBuffer = isBytes && Object.getPrototypeOf(data) === Buffer.prototype && !Object.hasOwn(data, 'length')
+  const length: number = !isBytes ? -1 : standardBuffer ? data.length : viewLength.call(data)
+  if (length < 0 || length > MAX_BODY - prefix) {
     throw new RpcError('INVALID_ARGUMENT', `Expected a byte payload of at most ${MAX_BODY - prefix} bytes`)
   }
-  return Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+  if (length === 0) {
+    try {
+      // The intrinsic distinguishes an empty view from one invalidated by transfer or resize.
+      setBytes.call(EMPTY, data)
+    } catch (cause) {
+      throw new RpcError('INVALID_ARGUMENT', 'RPC payload does not reference an available byte view', { cause })
+    }
+    return EMPTY
+  }
+  if (standardBuffer) return data as Buffer
+  const backing: ArrayBufferLike = viewBuffer.call(data)
+  const offset: number = viewOffset.call(data)
+  const prototype = Object.getPrototypeOf(backing)
+  if ((prototype === ArrayBuffer.prototype || prototype === SharedArrayBuffer.prototype)
+    && !Object.hasOwn(backing, 'byteLength')) {
+    return Buffer.from(backing, offset, length)
+  }
+  // Buffer.from(backing, ...) reads backing.byteLength through the public property.
+  return Buffer.from(new Uint8Array(backing, offset, length))
 }
 
 export function methodNameLength(name: string): number {
@@ -46,9 +76,7 @@ export function openFrame(id: number, name: string, data: Bytes, flags = 0): Fra
   body[0] = length
   body.write(name, 1, length, 'utf8')
   body.set(payload, offset)
-  const value = { type: FrameType.Open, id, flags, body, packet }
-  encodeHeader(value, packet)
-  return value
+  return { type: FrameType.Open, id, flags, body, packet }
 }
 
 export function readOpenBody(body: Buffer): { name: string; data: Buffer } {

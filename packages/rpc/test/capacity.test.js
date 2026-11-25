@@ -94,6 +94,44 @@ test('uses the lower negotiated limit independently in both directions', { timeo
   assert.deepEqual(reused.map(result => Buffer.from(result)), [payload, payload])
 })
 
+test('full-duplex uploads leave connection credit for streaming replies', { timeout: 8_000 }, async t => {
+  const ready = latch()
+  /** @type {RpcPeer | undefined} */
+  let accepted
+  /** @type {import('@ainess/rpc').RpcMethod} */
+  const echo = {
+    name: 'bidi.echo',
+    mode: RpcMode.Bidi,
+    async *handle({ input }) { for await (const bytes of input) yield bytes },
+  }
+  const server = await RpcServer.listen({
+    host: '127.0.0.1',
+    port: 0,
+    methods: [echo],
+    onPeer(peer) {
+      accepted = peer
+      ready.resolve()
+    },
+  })
+  t.after(() => server.close())
+  const client = await RpcPeer.connect(server.address, { methods: [echo] })
+  t.after(() => client.close())
+  await ready.promise
+  assert.ok(accepted)
+
+  const inputs = [0, 17, 4_096, 61_440, 65_536].map((size, index) => Buffer.alloc(size, index + 1))
+  const peers = [client, accepted]
+  await Promise.all(Array.from({ length: 240 }, async (_, index) => {
+    const output = peers[index % 2].stream(echo.name, {
+      async *input() { yield* inputs },
+      timeoutMs: 3_000,
+    })
+    let received = 0
+    for await (const chunk of output) assert.deepEqual(Buffer.from(chunk), inputs[received++])
+    assert.equal(received, inputs.length)
+  }))
+})
+
 test('an upload abort listener can immediately reuse the only call slot', { timeout: 5_000 }, async t => {
   const receiving = latch()
   const uploading = latch()
@@ -139,6 +177,36 @@ test('an upload abort listener can immediately reuse the only call slot', { time
   assert.ok(replacement)
   const [, echoed] = await Promise.all([cancelled, replacement])
   assert.deepEqual(Buffer.from(echoed), payload)
+})
+
+test('returning a response iterator during lazy startup releases its call slot', { timeout: 5_000 }, async t => {
+  const server = await RpcServer.listen({
+    host: '127.0.0.1',
+    port: 0,
+    maxConcurrentCalls: 1,
+    methods: [
+      {
+        name: 'events', mode: RpcMode.ServerStream,
+        async *handle({ signal }) {
+          if (!signal.aborted) await once(signal, 'abort')
+        },
+      },
+      { name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data },
+    ],
+  })
+  t.after(() => server.close())
+  const client = await RpcPeer.connect(server.address, { maxConcurrentCalls: 1 })
+  t.after(() => client.close())
+  const output = client.stream('events', {
+    get timeoutMs() {
+      void output.return?.()
+      return 2_000
+    },
+  })
+
+  assert.equal((await output.next()).done, true)
+  const payload = Buffer.from('slot released')
+  assert.deepEqual(Buffer.from(await client.request('echo', payload)), payload)
 })
 
 test('rejects invalid call limits before connecting or binding', { timeout: 5_000 }, async t => {

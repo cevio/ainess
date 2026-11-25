@@ -22,8 +22,9 @@ const fullWindow = HEADER_SIZE + MAX_BODY
  * @param {'dialer' | 'acceptor'} [role]
  * @param {import('../dist/wire.js').Frame[]} [afterHello]
  * @param {number} [maxIncomingCalls]
+ * @param {number} [streamWindow]
  */
-async function startModem(t, role = 'acceptor', afterHello = [], maxIncomingCalls) {
+async function startModem(t, role = 'acceptor', afterHello = [], maxIncomingCalls, streamWindow = fullWindow) {
   const listener = createServer()
   listener.listen(0, '127.0.0.1')
   await once(listener, 'listening')
@@ -53,7 +54,7 @@ async function startModem(t, role = 'acceptor', afterHello = [], maxIncomingCall
 
   const hello = encodeHello()
   hello.writeUInt32BE(fullWindow, 6)
-  hello.writeUInt32BE(fullWindow, 10)
+  hello.writeUInt32BE(streamWindow, 10)
   hello.writeUInt32BE(fullWindow, 14)
   send(peer, frame(FrameType.Hello, 0, hello), ...afterHello)
   await modem.ready
@@ -72,6 +73,39 @@ test('a low call limit still allows a burst of control frames during socket back
   assert.equal(backpressured, true)
   await Promise.all([data, ...controls])
   assert.equal(modem.failure, undefined)
+})
+
+test('the minimum stream window admits a full upload and any usable reserve admits a reply', { timeout: 5_000 }, async t => {
+  for (const role of /** @type {const} */ (['dialer', 'acceptor'])) {
+    for (const extra of [0, HEADER_SIZE - 1, HEADER_SIZE]) {
+      const { modem, peer, socket } = await startModem(t, role, [], undefined, fullWindow + extra)
+      const first = role === 'dialer' ? 1 : 2
+      const reply = role === 'dialer' ? 2 : 1
+      modem.open(first, true)
+      modem.open(first + 2, true)
+      modem.open(reply, true)
+
+      await modem.send(frame(FrameType.Data, first, Buffer.alloc(MAX_BODY)))
+      if (socket.writableNeedDrain) await once(socket, 'drain')
+
+      /** @type {string[]} */
+      const written = []
+      const upload = modem.send(frame(FrameType.Data, first + 2), () => { written.push('upload') })
+      void upload.catch(() => {})
+      assert.equal(written.length, 0)
+
+      const response = modem.send(frame(FrameType.Data, reply), () => { written.push('reply') })
+      void response.catch(() => {})
+
+      const canReply = extra === HEADER_SIZE
+      if (canReply) await response
+      assert.deepEqual(written, canReply ? ['reply'] : [])
+
+      send(peer, frame(FrameType.WindowUpdate, 0, writeUint32(fullWindow), 1))
+      await Promise.all([upload, response])
+      assert.deepEqual(written, canReply ? ['reply', 'upload'] : ['upload', 'reply'])
+    }
+  }
 })
 
 test('shared DATA credit accumulates for the oldest stream with available call credit', { timeout: 5_000 }, async t => {

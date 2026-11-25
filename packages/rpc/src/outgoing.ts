@@ -1,4 +1,5 @@
-import { addAbortListener } from 'node:events'
+import { isAnyArrayBuffer, isUint8Array } from 'node:util/types'
+import { observeAbort } from './abort.js'
 import { deferred } from './deferred.js'
 import type { Deferred } from './deferred.js'
 import { byteBody, frame, invalidProtocol, openFrame, readError } from './messages.js'
@@ -17,7 +18,7 @@ interface Call {
   uploadEnded: boolean
   opened: boolean
   timeout?: NodeJS.Timeout
-  abort?: Disposable
+  abort?: () => void
 }
 
 function cancelled(): RpcError {
@@ -29,6 +30,29 @@ function isError<T extends Error>(value: unknown, type: new (...args: never[]) =
     return value instanceof type
   } catch {
     return false
+  }
+}
+
+function responseIterator(
+  open: (output: IncomingStream) => (() => void) | undefined,
+): AsyncIterableIterator<Bytes> {
+  const output = new IncomingStream()
+  let start: typeof open | undefined = open
+  return {
+    [Symbol.asyncIterator]() { return this },
+    next() {
+      if (start) {
+        const opening = start
+        start = undefined
+        const cancel = opening(output)
+        if (cancel) output.setOnStop(cancel)
+      }
+      return output.next()
+    },
+    return() {
+      start = undefined
+      return output.return()
+    },
   }
 }
 
@@ -48,29 +72,14 @@ export class OutgoingCalls {
   }
 
   stream(name: string, dataOrOptions?: Bytes | RpcCallOptions, options?: RpcCallOptions): AsyncIterableIterator<Bytes> {
-    let call: Call | undefined
-    let started = false
-    const output = new IncomingStream(() => {
-      if (call) this.#cancel(call, cancelled())
+    return responseIterator(output => {
+      try {
+        const call = this.#start(name, dataOrOptions, options, { output })
+        return () => this.#cancel(call, cancelled())
+      } catch (error) {
+        output.fail(isError(error, Error) ? error : new RpcError('INTERNAL', 'RPC startup failed'))
+      }
     })
-    return {
-      [Symbol.asyncIterator]() { return this },
-      next: () => {
-        if (!started) {
-          started = true
-          try {
-            call = this.#start(name, dataOrOptions, options, { output })
-          } catch (error) {
-            output.fail(isError(error, Error) ? error : new RpcError('INTERNAL', 'RPC startup failed'))
-          }
-        }
-        return output.next()
-      },
-      return: () => {
-        started = true
-        return output.return()
-      },
-    }
   }
 
   closed(error: RpcError): void {
@@ -83,16 +92,17 @@ export class OutgoingCalls {
   }): Call {
     if (this.modem.failure) throw this.modem.failure
     let data: Bytes = EMPTY
-    if (dataOrOptions instanceof Uint8Array) {
+    if (isUint8Array(dataOrOptions)) {
       data = dataOrOptions
     } else if (dataOrOptions !== undefined) {
       if (options !== undefined || dataOrOptions === null || typeof dataOrOptions !== 'object'
-        || ArrayBuffer.isView(dataOrOptions)) {
+        || ArrayBuffer.isView(dataOrOptions) || isAnyArrayBuffer(dataOrOptions)) {
         throw new RpcError('INVALID_ARGUMENT', 'Expected RPC request bytes or call options')
       }
       options = dataOrOptions
     }
-    if (options?.signal?.aborted) throw cancelled()
+    const signal = options?.signal
+    if (signal?.aborted) throw cancelled()
     const input = options?.input
     if (input !== undefined && typeof input !== 'function') {
       throw new RpcError('INVALID_ARGUMENT', 'RPC input must be a stream factory')
@@ -101,37 +111,59 @@ export class OutgoingCalls {
     if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 0x7fffffff)) {
       throw new RpcError('INVALID_ARGUMENT', 'Invalid RPC call timeout')
     }
-    if (this.#calls.size >= this.modem.maxCalls) {
-      throw new RpcError('RESOURCE_EXHAUSTED', 'RPC connection reached its active call limit')
-    }
-    const id = this.modem.nextCallId
-    if (id > 0xffffffff) throw new RpcError('RESOURCE_EXHAUSTED', 'RPC connection exhausted its call IDs')
-
+    if (signal?.aborted) throw cancelled()
+    if (this.modem.failure) throw this.modem.failure
+    const limit = this.modem.maxCalls
+    this.#checkCapacity(limit)
     const mode = (input ? RpcMode.ClientStream : 0) | (target.output ? RpcMode.ServerStream : 0)
-    const open = openFrame(id, name, data, mode)
-    const call: Call = {
-      ...target,
-      id,
-      upload: input ? new AbortController() : undefined,
-      uploadEnded: false,
-      opened: false,
+    const open = openFrame(0, name, data, mode)
+    let call: Call | undefined
+    let aborted = false
+    const stopObserving = signal && observeAbort(signal, () => {
+      if (call) this.#cancel(call, cancelled())
+      else aborted = true
+    })
+    try {
+      if (signal?.aborted || aborted) throw cancelled()
+      if (this.modem.failure) throw this.modem.failure
+      this.#checkCapacity(limit)
+      const id = this.modem.nextCallId
+      if (id > 0xffffffff) throw new RpcError('RESOURCE_EXHAUSTED', 'RPC connection exhausted its call IDs')
+      open.id = id
+      this.modem.open(id, mode !== RpcMode.Unary)
+      call = {
+        ...target,
+        id,
+        upload: input ? new AbortController() : undefined,
+        uploadEnded: false,
+        opened: false,
+        abort: stopObserving,
+      }
+      this.#calls.set(id, call)
+    } catch (error) {
+      stopObserving?.()
+      throw error
     }
-    if (options?.signal) call.abort = addAbortListener(options.signal, () => this.#cancel(call, cancelled()))
+    const started = call
     if (timeoutMs !== undefined) {
-      call.timeout = setTimeout(() => {
-        this.#cancel(call, new RpcError('DEADLINE_EXCEEDED', 'RPC call timed out'))
+      started.timeout = setTimeout(() => {
+        this.#cancel(started, new RpcError('DEADLINE_EXCEEDED', 'RPC call timed out'))
       }, timeoutMs).unref()
     }
-    this.#calls.set(id, call)
-    this.modem.open(id, mode !== RpcMode.Unary)
     if (this.modem.trySend(open, this.#calls.size > 1)) {
-      call.opened = true
-      if (input) void Promise.resolve().then(() => this.#upload(call, input)).catch(error => this.#cancel(call, error))
+      started.opened = true
+      if (input) void Promise.resolve().then(() => this.#upload(started, input)).catch(error => this.#cancel(started, error))
     } else {
-      const queued = this.modem.send(open, () => { call.opened = true })
-      void (input ? queued.then(() => this.#upload(call, input)) : queued).catch(error => this.#cancel(call, error))
+      const queued = this.modem.send(open, () => { started.opened = true })
+      void (input ? queued.then(() => this.#upload(started, input)) : queued).catch(error => this.#cancel(started, error))
     }
-    return call
+    return started
+  }
+
+  #checkCapacity(limit: number): void {
+    if (this.#calls.size >= limit) {
+      throw new RpcError('RESOURCE_EXHAUSTED', 'RPC connection reached its active call limit')
+    }
   }
 
   async #upload(call: Call, input: NonNullable<RpcCallOptions['input']>): Promise<void> {
@@ -181,7 +213,8 @@ export class OutgoingCalls {
     release()
     this.#retire(call)
     call.output?.end()
-    call.result?.resolve(body)
+    call.result?.resolve(body === EMPTY ? Buffer.alloc(0) : body)
+    call.abort?.()
     if (!call.uploadEnded) call.upload?.abort()
   }
 
@@ -198,13 +231,13 @@ export class OutgoingCalls {
     }
     call.output?.fail(error, discard)
     call.result?.reject(error)
+    call.abort?.()
     if (!call.uploadEnded) call.upload?.abort()
   }
 
   #retire(call: Call, error?: RpcError): boolean {
     if (!this.#calls.delete(call.id)) return false
     clearTimeout(call.timeout)
-    call.abort?.[Symbol.dispose]()
     if (error || call.upload || call.output) this.modem.retire(call.id, error)
     return true
   }

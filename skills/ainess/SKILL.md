@@ -54,6 +54,8 @@ description: 使用、组合和验证 Ainess 的公开能力。用于使用 @ain
 
 用 `RpcServer.listen({ host, port, onPeer })` 开始监听，用 `RpcPeer.connect({ host, port }, { methods })` 建连并等待握手。拨号和接入的两端共享一条 TCP 连接，都可发起和处理调用。监听端在 `onPeer` 取得接入端点，处理函数通过上下文的 `peer` 发起同连接反向调用。用 `peer.register()` 注册连接专属方法，用 `server.register()` 注册监听器共享方法。连接专属方法优先于同名共享方法。返回的注销函数立即移除该注册，并等待它已接收的调用清理。任一端可用 `request(name, options?)` 接收单响应，用 `stream(name, options?)` 接收流。发送初始数据时，在方法名和选项之间传入 `Uint8Array`。提供 `options.input` 开启上传流，上传源应响应自己的 `AbortSignal`。处理方可通过 `input.stop()` 只停止上传方向。业务对象由应用编解码，结束时等待端点和监听器的 `close()`。 [Cordis 装配示例](references/assembly.md#接入-tcp-rpc) · [RPC 手册](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md)
 
+两端启用 TCP KeepAlive。对任一端点使用 `peer.onClose(listener)` 订阅一次异步关闭通知，已关闭的端点也会通知新订阅。监听器接收 `RpcCloseInfo` 的 `reason` 和 `error`，返回的取消订阅函数由调用方管理。应用可在通知时从连接表移除端点，并自行安排重连。 [连接保活和关闭通知](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#连接保活和关闭通知)
+
 ## 开发和验证
 
 1. 核对当前版本的依赖、公开入口和类型。Ainess 源码检出内读根 `llms.txt`、包级 `AGENTS.md` 和手册。使用外部项目时优先查实际安装的包或同版本源码。 [文档索引](https://github.com/cevio/ainess/blob/main/llms.txt)

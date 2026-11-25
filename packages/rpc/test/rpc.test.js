@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { createConnection, createServer } from 'node:net'
 import { setTimeout as delay } from 'node:timers/promises'
+import { runInNewContext } from 'node:vm'
 import test from 'node:test'
 import { RpcClient, RpcError, RpcMode, RpcServer } from '@ainess/rpc'
 import { encodeHeader, encodeHello, FrameType } from '../dist/wire.js'
@@ -243,6 +244,258 @@ test('omitted request data reaches every RPC mode as empty bytes', { timeout: 5_
     collect(client.stream('empty.chat', { input: upload })),
     client.request('empty.echo', undefined, { timeoutMs: 1_000 }).then(decode),
   ]), ['', [''], '|chunk', ['', 'chunk'], ''])
+})
+
+test('Uint8Arrays from another realm work as request data, responses and stream chunks', { timeout: 5_000 }, async t => {
+  /** @type {Uint8Array} */
+  const foreign = runInNewContext('Uint8Array.of(0, 114, 112, 99, 0).subarray(1, 4)')
+  assert.equal(foreign instanceof Uint8Array, false)
+  const { client } = await startPair(t, [
+    { name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data },
+    { name: 'direct', mode: RpcMode.Unary, handle: () => foreign },
+    { name: 'promised', mode: RpcMode.Unary, handle: async () => foreign },
+    {
+      name: 'bidi',
+      mode: RpcMode.Bidi,
+      async *handle({ input }) {
+        yield foreign
+        yield* input
+      },
+    },
+  ])
+
+  assert.deepEqual(await Promise.all([
+    client.request('echo', foreign).then(decode),
+    client.request('direct').then(decode),
+    client.request('promised').then(decode),
+    collect(client.stream('bidi', { async *input() { yield foreign } })),
+  ]), ['rpc', 'rpc', 'rpc', ['rpc', 'rpc']])
+})
+
+test('a signal option is read once before assigning the call ID', { timeout: 5_000 }, async t => {
+  const { client } = await startPair(t, [
+    { name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data },
+  ])
+  const controller = new AbortController()
+  let reads = 0
+  const result = await client.request('echo', bytes('outer'), {
+    get signal() {
+      if (++reads === 2) void client.request('echo', bytes('nested')).catch(() => {})
+      return controller.signal
+    },
+  })
+
+  assert.equal(decode(result), 'outer')
+  assert.equal(reads, 1)
+  assert.equal(decode(await client.request('echo', bytes('next'))), 'next')
+})
+
+test('payload bounds use the real typed-array view instead of shadowed properties', { timeout: 5_000 }, async t => {
+  let reads = 0
+  const backing = Uint8Array.of(0, 114, 112, 99, 0)
+  const other = Uint8Array.of(100, 97, 116, 97)
+  class ObservedBytes extends Uint8Array {
+    get byteLength() {
+      reads++
+      return 1
+    }
+
+    get byteOffset() {
+      reads++
+      return 0
+    }
+
+    get buffer() {
+      reads++
+      return other.buffer
+    }
+  }
+  const view = new ObservedBytes(backing.buffer, 1, 3)
+  const buffer = bytes('buf')
+  Object.defineProperty(buffer, 'length', {
+    get() {
+      reads++
+      return 1
+    },
+  })
+  const { client } = await startPair(t, [
+    { name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data },
+    { name: 'buffer', mode: RpcMode.Unary, handle: () => buffer },
+    { name: 'stream', mode: RpcMode.ServerStream, async *handle() { yield view } },
+  ])
+
+  assert.deepEqual(await Promise.all([
+    client.request('echo', view).then(decode),
+    client.request('echo', buffer).then(decode),
+    client.request('buffer').then(decode),
+    collect(client.stream('stream')),
+  ]), ['rpc', 'buf', 'buf', ['rpc']])
+  assert.equal(reads, 0)
+})
+
+test('byte views backed by ArrayBuffer subclasses preserve their actual bytes', { timeout: 5_000 }, async t => {
+  let reads = 0
+  class ObservedBuffer extends ArrayBuffer {
+    get byteLength() {
+      reads++
+      return super.byteLength
+    }
+  }
+  const backing = new ObservedBuffer(5)
+  const view = new Uint8Array(backing, 1, 3)
+  view.set(bytes('rpc'))
+  const { client } = await startPair(t, [
+    { name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data },
+    { name: 'view', mode: RpcMode.Unary, handle: () => view },
+    { name: 'stream', mode: RpcMode.ServerStream, async *handle() { yield view } },
+  ])
+
+  assert.deepEqual(await Promise.all([
+    client.request('echo', view).then(decode),
+    client.request('view').then(decode),
+    collect(client.stream('stream')),
+  ]), ['rpc', 'rpc', ['rpc']])
+  assert.equal(reads, 0)
+})
+
+test('bare backing stores are rejected instead of invoking the method with empty data', { timeout: 5_000 }, async t => {
+  let calls = 0
+  const { client } = await startPair(t, [{
+    name: 'record',
+    mode: RpcMode.Unary,
+    handle({ data }) {
+      calls++
+      return data
+    },
+  }])
+
+  for (const storage of [new ArrayBuffer(4), new SharedArrayBuffer(4)]) {
+    // @ts-expect-error JavaScript callers can pass a backing store instead of a byte view.
+    await assert.rejects(client.request('record', storage), { code: 'INVALID_ARGUMENT' })
+  }
+  assert.equal(decode(await client.request('record', bytes('active'))), 'active')
+  assert.equal(calls, 1)
+})
+
+test('invalidated byte views fail their own call without disconnecting the peer', { timeout: 5_000 }, async t => {
+  const request = new Uint8Array(4)
+  const reply = Buffer.alloc(4)
+  structuredClone(request.buffer, { transfer: [request.buffer] })
+  assert.ok(reply.buffer instanceof ArrayBuffer)
+  structuredClone(reply.buffer, { transfer: [reply.buffer] })
+  /** @type {Uint8Array} */
+  const outOfBounds = runInNewContext(`
+    const buffer = new ArrayBuffer(4, { maxByteLength: 8 })
+    const view = new Uint8Array(buffer, 2, 2)
+    buffer.resize(1)
+    view
+  `)
+  const { client } = await startPair(t, [
+    { name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data },
+    { name: 'reply', mode: RpcMode.Unary, handle: () => reply },
+    { name: 'stream', mode: RpcMode.ServerStream, async *handle() { yield reply } },
+  ])
+
+  await assert.rejects(client.request('echo', request), { code: 'INVALID_ARGUMENT' })
+  await assert.rejects(client.request('echo', outOfBounds), { code: 'INVALID_ARGUMENT' })
+  await assert.rejects(client.request('reply'), { code: 'INVALID_ARGUMENT' })
+  await assert.rejects(client.stream('stream').next(), { code: 'INVALID_ARGUMENT' })
+  assert.equal(decode(await client.request('echo', bytes('active'))), 'active')
+})
+
+test('transferring an empty received view keeps other empty payloads usable', { timeout: 5_000 }, async t => {
+  const { client } = await startPair(t, [
+    { name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data },
+    { name: 'stream', mode: RpcMode.ServerStream, async *handle() { yield new Uint8Array(0) } },
+  ])
+
+  const unary = await client.request('echo')
+  assert.ok(unary.buffer instanceof ArrayBuffer)
+  structuredClone(unary.buffer, { transfer: [unary.buffer] })
+
+  const stream = client.stream('stream')
+  const chunk = await stream.next()
+  assert.equal(chunk.done, false)
+  assert.ok(chunk.value.buffer instanceof ArrayBuffer)
+  structuredClone(chunk.value.buffer, { transfer: [chunk.value.buffer] })
+  assert.equal((await stream.next()).done, true)
+
+  assert.equal((await client.request('echo')).byteLength, 0)
+  assert.equal(decode(await client.request('echo', bytes('active'))), 'active')
+})
+
+test('exact frame limits succeed and a byte over the limit leaves the connection usable', { timeout: 5_000 }, async t => {
+  const methodName = '界'.repeat(85)
+  const maxFrame = 64 * 1024
+  const maxRequest = maxFrame - 1 - Buffer.byteLength(methodName)
+  const largest = Buffer.alloc(maxRequest, 0x61)
+  const streamChunks = [0, 4_096, 4_097, maxFrame].map((size, index) => Buffer.alloc(size, index))
+  const { client } = await startPair(t, [
+    { name: methodName, mode: RpcMode.Unary, handle: ({ data }) => data },
+    { name: 'largestReply', mode: RpcMode.Unary, handle: () => streamChunks[3] },
+    { name: 'oversizedReply', mode: RpcMode.Unary, handle: () => Buffer.alloc(maxFrame + 1) },
+    { name: 'streams', mode: RpcMode.ServerStream, async *handle() { yield* streamChunks } },
+    { name: 'upload', mode: RpcMode.ClientStream, async handle({ input }) {
+      let received = 0
+      for await (const chunk of input) received += chunk.length
+      return bytes(String(received))
+    } },
+  ])
+
+  assert.deepEqual(await client.request(methodName, largest), largest)
+  await assert.rejects(client.request(methodName, Buffer.alloc(maxRequest + 1)), { code: 'INVALID_ARGUMENT' })
+  assert.deepEqual(await client.request('largestReply'), streamChunks[3])
+  await assert.rejects(client.request('oversizedReply'), { code: 'INVALID_ARGUMENT' })
+  assert.deepEqual(await collect(client.stream('streams')), streamChunks.map(decode))
+  await assert.rejects(client.request('upload', {
+    async *input() { yield Buffer.alloc(maxFrame + 1) },
+  }), { code: 'INVALID_ARGUMENT' })
+  assert.equal(await client.request('upload', {
+    async *input() { yield* streamChunks },
+  }).then(decode), String(streamChunks.reduce((size, chunk) => size + chunk.length, 0)))
+})
+
+test('deadlines accept the maximum timer value and reject invalid values before dispatch', { timeout: 5_000 }, async t => {
+  let calls = 0
+  const { client } = await startPair(t, [{
+    name: 'echo',
+    mode: RpcMode.Unary,
+    handle() {
+      calls++
+      return bytes('ok')
+    },
+  }])
+  for (const timeoutMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 0x80000000]) {
+    await assert.rejects(client.request('echo', { timeoutMs }), { code: 'INVALID_ARGUMENT' })
+  }
+  assert.equal(await client.request('echo', { timeoutMs: 0x7fffffff }).then(decode), 'ok')
+  assert.equal(calls, 1)
+})
+
+test('aborting from another option accessor prevents dispatch', { timeout: 5_000 }, async t => {
+  let calls = 0
+  const { client } = await startPair(t, [
+    {
+      name: 'record',
+      mode: RpcMode.Unary,
+      handle() {
+        calls++
+        return bytes('called')
+      },
+    },
+    { name: 'barrier', mode: RpcMode.Unary, handle: () => bytes('processed') },
+  ])
+  const controller = new AbortController()
+  await assert.rejects(client.request('record', {
+    signal: controller.signal,
+    get timeoutMs() {
+      controller.abort()
+      return 1_000
+    },
+  }), { code: 'CANCELLED' })
+
+  assert.equal(decode(await client.request('barrier')), 'processed')
+  assert.equal(calls, 0)
 })
 
 test('UTF-8 method names dispatch exactly through the same TCP connection', { timeout: 5_000 }, async t => {

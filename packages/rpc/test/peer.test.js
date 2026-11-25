@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
 import { once } from 'node:events'
-import { createConnection, createServer } from 'node:net'
+import { createConnection, createServer, Socket } from 'node:net'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { RpcClient, RpcMode, RpcPeer, RpcServer } from '@ainess/rpc'
+import { encodeHeader, encodeHello, FrameType } from '../dist/wire.js'
 
 /** @param {string} value */
 const bytes = value => Buffer.from(value)
@@ -20,6 +24,14 @@ function latch() {
 function untilAborted(signal) {
   if (signal.aborted) return Promise.resolve()
   return new Promise(resolve => signal.addEventListener('abort', () => resolve(undefined), { once: true }))
+}
+
+/**
+ * @param {RpcPeer} peer
+ * @returns {Promise<import('@ainess/rpc').RpcCloseInfo>}
+ */
+function waitForClose(peer) {
+  return new Promise(resolve => { peer.onClose(resolve) })
 }
 
 /** @param {AsyncIterable<Uint8Array>} stream */
@@ -57,6 +69,55 @@ async function startPeers(t, serverMethods, clientMethods) {
   assert.ok(accepted)
   return { client, accepted }
 }
+
+test('dial listener cleanup leaves the ready peer usable', { timeout: 5_000 }, async t => {
+  const server = await RpcServer.listen({
+    host: '127.0.0.1',
+    port: 0,
+    methods: [{ name: 'probe', mode: RpcMode.Unary, handle: () => bytes('ready') }],
+  })
+  t.after(() => server.close())
+
+  for (const behavior of ['throws', 'aborts']) {
+    const controller = new AbortController()
+    const { signal } = controller
+    const remove = signal.removeEventListener.bind(signal)
+    /**
+     * @param {string} type
+     * @param {EventListenerOrEventListenerObject} listener
+     * @param {boolean | EventListenerOptions} [options]
+     */
+    function removeDuringCleanup(type, listener, options) {
+      if (behavior === 'throws') throw new Error('observer cleanup failed')
+      controller.abort()
+      remove(type, listener, options)
+    }
+    signal.removeEventListener = removeDuringCleanup
+    const peer = await RpcPeer.connect(server.address, { signal })
+    t.after(() => peer.close())
+    controller.abort()
+    assert.equal(decode(await peer.request('probe', { timeoutMs: 1_000 })), 'ready')
+  }
+})
+
+test('a failed handshake preserves its error when dial listener cleanup throws', { timeout: 5_000 }, async t => {
+  const listener = createServer(socket => {
+    socket.on('error', () => {})
+    socket.resume()
+    socket.end()
+  })
+  t.after(() => new Promise(resolve => listener.close(() => resolve(undefined))))
+  listener.listen(0, '127.0.0.1')
+  await once(listener, 'listening')
+  const address = listener.address()
+  assert.ok(address && typeof address !== 'string')
+
+  const { signal } = new AbortController()
+  signal.removeEventListener = () => { throw new Error('observer cleanup failed') }
+  await assert.rejects(RpcPeer.connect({ host: address.address, port: address.port }, { signal }), {
+    code: 'UNAVAILABLE',
+  })
+})
 
 test('a single TCP connection accepts concurrent first calls in both directions', { timeout: 5_000 }, async t => {
   const toServerStarted = latch()
@@ -195,6 +256,64 @@ test('the connected peer can add and remove a reverse method after its handshake
   await assert.rejects(accepted.request('probe'), { code: 'NOT_FOUND' })
 })
 
+test('missing methods and mode mismatches fail only their own call in both directions', { timeout: 5_000 }, async t => {
+  let unexpectedCalls = 0
+  /** @type {import('@ainess/rpc').RpcMethod[]} */
+  const methods = [
+    { name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data },
+    {
+      name: 'unaryOnly',
+      mode: RpcMode.Unary,
+      handle() {
+        unexpectedCalls++
+        return bytes('unexpected')
+      },
+    },
+    {
+      name: 'streamOnly',
+      mode: RpcMode.ServerStream,
+      async *handle() {
+        unexpectedCalls++
+        yield bytes('unexpected')
+      },
+    },
+  ]
+  const { accepted, client } = await startPeers(t, methods, methods)
+  /** @type {Promise<unknown>[]} */
+  const cleanups = []
+  /** @param {AbortSignal} signal */
+  async function* input(signal) {
+    const stopped = latch()
+    cleanups.push(stopped.promise)
+    try {
+      yield Buffer.alloc(64 * 1024)
+      await untilAborted(signal)
+    } finally {
+      stopped.resolve()
+    }
+  }
+
+  await Promise.all([client, accepted].map(async peer => {
+    const options = { timeoutMs: 2_000 }
+    const upload = { ...options, input }
+    /** @type {[string, (name: string) => Promise<unknown>][]} */
+    const cases = [
+      ['streamOnly', name => peer.request(name, options)],
+      ['unaryOnly', name => peer.stream(name, options).next()],
+      ['unaryOnly', name => peer.request(name, upload)],
+      ['unaryOnly', name => peer.stream(name, upload).next()],
+    ]
+    for (const [wrongMode, invoke] of cases) {
+      await assert.rejects(invoke('missing'), { code: 'NOT_FOUND', message: 'Unknown RPC method missing' })
+      await assert.rejects(invoke(wrongMode), { code: 'INVALID_ARGUMENT' })
+      assert.equal(decode(await peer.request('echo', bytes('connected'), options)), 'connected')
+    }
+  }))
+  assert.ok(cleanups.length > 0)
+  await Promise.all(cleanups)
+  assert.equal(unexpectedCalls, 0)
+})
+
 test('stopping one upload preserves the reverse bidi RPC on the same connection', { timeout: 5_000 }, async t => {
   const forwardWaiting = latch()
   const forwardStopped = latch()
@@ -283,7 +402,94 @@ test('closing a peer settles outstanding calls and handlers in both directions',
 
   const toServer = assert.rejects(client.request('wait'), { code: 'UNAVAILABLE' })
   const toClient = assert.rejects(accepted.request('wait'), { code: 'UNAVAILABLE' })
+  const clientClosed = waitForClose(client)
+  const acceptedClosed = waitForClose(accepted)
   await Promise.all([toServerStarted.promise, toClientStarted.promise])
-  await client.close()
+  await Promise.all([client.close(), client.close()])
   await Promise.all([toServer, toClient, toServerAborted.promise, toClientAborted.promise])
+  const [local, remote] = await Promise.all([clientClosed, acceptedClosed])
+  assert.equal(local.reason, 'local')
+  assert.equal(remote.reason, 'remote')
+  assert.equal(local.error.code, 'UNAVAILABLE')
+  assert.equal(remote.error.code, 'UNAVAILABLE')
+})
+
+test('TCP keepalive is enabled on both ends of a peer connection', { timeout: 5_000 }, async t => {
+  const keepalive = t.mock.method(Socket.prototype, 'setKeepAlive')
+  await startPeers(t, [], [])
+
+  assert.deepEqual(keepalive.mock.calls.map(call => call.arguments), [[true, 30_000], [true, 30_000]])
+  assert.notEqual(keepalive.mock.calls[0].this, keepalive.mock.calls[1].this)
+})
+
+test('close listeners are independent, fire once, and replay the reason to late subscribers', { timeout: 5_000 }, async t => {
+  const { client } = await startPeers(t, [], [])
+  /** @type {string[]} */
+  const notifications = []
+  const listener = () => { notifications.push('active') }
+  const unsubscribe = client.onClose(listener)
+  client.onClose(listener)
+  unsubscribe()
+  unsubscribe()
+  client.onClose(() => {
+    notifications.push('throw')
+    throw new Error('close observer failed')
+  })
+  client.onClose(async () => {
+    notifications.push('reject')
+    throw new Error('async close observer failed')
+  })
+  const notified = waitForClose(client)
+
+  await Promise.all([client.close(), client.close()])
+  const initial = await notified
+  assert.deepEqual(notifications.sort(), ['active', 'reject', 'throw'])
+
+  const late = waitForClose(client)
+  const unsubscribeLate = client.onClose(() => { notifications.push('cancelled late') })
+  unsubscribeLate()
+  client.onClose(() => { notifications.push('late') })
+  assert.equal(notifications.includes('late'), false)
+  assert.equal(await late, initial)
+  assert.deepEqual(notifications.sort(), ['active', 'late', 'reject', 'throw'])
+})
+
+test('retained close listener disposers do not keep closed peers alive', async () => {
+  const fixture = fileURLToPath(new URL('./fixtures/close-listener-retention.mjs', import.meta.url))
+  await promisify(execFile)(process.execPath, ['--expose-gc', fixture], { timeout: 5_000 })
+})
+
+test('retained terminal response iterators do not keep closed peers alive', async () => {
+  const fixture = fileURLToPath(new URL('./fixtures/stream-retention.mjs', import.meta.url))
+  await promisify(execFile)(process.execPath, ['--expose-gc', fixture], { timeout: 5_000 })
+})
+
+test('a truncated frame reports a connection error to the accepted peer', { timeout: 5_000 }, async t => {
+  const ready = latch()
+  /** @type {RpcPeer | undefined} */
+  let accepted
+  const server = await RpcServer.listen({
+    host: '127.0.0.1',
+    port: 0,
+    onPeer(peer) {
+      accepted = peer
+      ready.resolve()
+    },
+  })
+  t.after(() => server.close())
+  const socket = createConnection(server.address)
+  t.after(() => { socket.destroy() })
+  socket.on('error', () => {})
+  socket.resume()
+  const hello = { type: FrameType.Hello, id: 0, flags: 0, body: encodeHello() }
+  socket.write(Buffer.concat([encodeHeader(hello), hello.body]))
+  await ready.promise
+  assert.ok(accepted)
+  const closed = waitForClose(accepted)
+  socket.end(Buffer.of(0))
+
+  const info = await closed
+  assert.equal(info.reason, 'error')
+  assert.equal(info.error.code, 'UNAVAILABLE')
+  assert.match(info.error.message, /truncated/i)
 })
