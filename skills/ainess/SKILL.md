@@ -1,11 +1,11 @@
 ---
 name: ainess
-description: 使用、组合和验证 Ainess 的公开能力。用于使用 @ainess/* 的应用、编写 ainess.config、装配 Cordis 服务与入口、用 CLI 启停应用、接入 HTTP Controller、Next.js、Model、TypeORM 或 Redis，以及复用目录加载能力。
+description: 使用、组合和验证 Ainess 的公开能力。用于使用 @ainess/* 的应用、编写 ainess.config、装配 Cordis 服务与入口、用 CLI 启停应用、接入 HTTP Controller、Next.js、Model、TypeORM、Redis 或 TCP RPC，以及复用目录加载能力。
 ---
 
 # 使用 Ainess
 
-用 Ainess 组装基于 Cordis 的 TypeScript ESM 应用。先读目标项目的指引和依赖，确认应用通过 `ainess.config` 还是直接用 Cordis 装配。使用项目声明的 Cordis、Ainess 和宿主库版本，从发行包的公开入口导入。
+用 Ainess 组装 TypeScript ESM 应用。先读目标项目的指引和依赖。使用 Cordis 时，确认应用通过 `ainess.config` 还是直接用 Cordis 装配。使用项目声明的 Ainess 和宿主库版本，从包的公开入口导入。
 
 ## 包之间如何配合
 
@@ -49,6 +49,10 @@ description: 使用、组合和验证 Ainess 的公开能力。用于使用 @ain
 ### `@ainess/loader`
 
 需要新模块类型或文件路由时，用 `scanModules({ directory, suffix, extensions })` 取有序文件清单，用 `parseFileRoute(stem, { prefix, source })` 解析路径，再用 `importModules(files, decode, signal?)` 导入和校验选中的默认导出。只需要全部扫描和导入时使用 `loadModules()`。先校验可从文件路径判断的错误，再执行模块。消费方负责业务注册、取消及资源清理。 [复用 Loader](references/assembly.md#复用-loader) · [loader 手册](https://github.com/cevio/ainess/blob/main/packages/loader/README.md)
+
+### `@ainess/rpc`
+
+用 `RpcServer.listen({ host, port, onPeer })` 开始监听，用 `RpcPeer.connect({ host, port }, { methods })` 建连并等待握手。拨号和接入的两端共享一条 TCP 连接，都可发起和处理调用。监听端在 `onPeer` 取得接入端点，处理函数通过上下文的 `peer` 发起同连接反向调用。用 `peer.register()` 注册连接专属方法，用 `server.register()` 注册监听器共享方法。连接专属方法优先于同名共享方法。返回的注销函数立即移除该注册，并等待它已接收的调用清理。任一端可用 `request(name, options?)` 接收单响应，用 `stream(name, options?)` 接收流。发送初始数据时，在方法名和选项之间传入 `Uint8Array`。提供 `options.input` 开启上传流，上传源应响应自己的 `AbortSignal`。处理方可通过 `input.stop()` 只停止上传方向。业务对象由应用编解码，结束时等待端点和监听器的 `close()`。 [Cordis 装配示例](references/assembly.md#接入-tcp-rpc) · [RPC 手册](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md)
 
 ## 开发和验证
 

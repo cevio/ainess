@@ -1,6 +1,6 @@
 # Ainess 应用装配
 
-以下示例可在安装技能的应用目录使用。应用依赖从已有的工作区或包源取得，并使用与 Ainess 兼容的 Cordis 版本。
+以下示例可在安装技能的应用目录使用。应用依赖从已有的工作区或包源取得。使用 Cordis 时，选择与 Ainess 兼容的版本。
 
 ## 运行 HTTP、Model 和 TypeORM
 
@@ -176,3 +176,61 @@ console.log(routes, views.map(({ value }) => value))
 ```
 
 先用 `scanModules()` 得到排序后的文件记录，必要时在导入前统一校验路径。`importModules()` 执行模块并把默认导出交给解码器。消费插件管理注册、冲突回滚和卸载。无需预处理时可直接用 `loadModules(options, decode)`。HTTP Controller 的 `[...name]` 匹配非空剩余路径，更具体的通配没有剩余路径时，同一方法的上级通配仍可匹配。
+
+## 接入 TCP RPC
+
+宿主提供 `@ainess/rpc`、`@ainess/framework` 和 `@deepseek-ai/cordis`。以下 `rpc.mjs` 把 RPC 监听器装配为框架入口，通过 `ctx.effect()` 托管，由框架关闭。拨号端请求问候时，接入端通过同一条连接反向调用拨号端的方法。
+
+```js
+import { defineApp, use } from '@ainess/framework'
+import { RpcMode, RpcPeer, RpcServer } from '@ainess/rpc'
+
+/** @type {import('@ainess/rpc').RpcAddress | undefined} */
+let address
+
+const app = defineApp({
+  entries: {
+    rpc: use(async (ctx) => {
+      await ctx.effect(async () => {
+        const server = await RpcServer.listen({
+          host: '127.0.0.1',
+          port: 0,
+          onPeer(peer) {
+            peer.register({
+              name: 'demo.greet',
+              mode: RpcMode.Unary,
+              handle: ({ peer, signal }) => peer.request('demo.message', { signal, timeoutMs: 5_000 }),
+            })
+          },
+        })
+        address = server.address
+        return () => server.close()
+      })
+    }),
+  },
+})
+
+const running = await app.start()
+try {
+  if (!address) throw new Error('RPC entry did not start')
+  const peer = await RpcPeer.connect(address, {
+    methods: [{
+      name: 'demo.message',
+      mode: RpcMode.Unary,
+      handle: () => new TextEncoder().encode('hello'),
+    }],
+  })
+  try {
+    const reply = await peer.request('demo.greet', {
+      timeoutMs: 5_000,
+    })
+    console.log(new TextDecoder().decode(reply))
+  } finally {
+    await peer.close()
+  }
+} finally {
+  await running.stop()
+}
+```
+
+运行 `node rpc.mjs` 会输出 `hello`。`app.start()` 等待 RPC 监听就绪，`RpcPeer.connect()` 等待握手，监听端在分派首个入站调用前执行 `onPeer`。问候处理函数通过上下文的 `peer` 反向调用 `demo.message`，并用 `signal` 传递取消信号。长期使用的端点由其调用方或创建它的插件复用并在退出时关闭。 [同连接反向调用与双向流](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#快速开始)

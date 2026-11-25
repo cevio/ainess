@@ -18,9 +18,11 @@
 - [@ainess/typeorm 用 Cordis 管理 TypeORM DataSource、仓储和事务](packages/typeorm/README.md)
 - [@ainess/ioredis 用 Cordis 管理 Redis 单节点、Sentinel 或 Cluster](packages/ioredis/README.md)
 - [@ainess/loader 复用模块扫描、默认导出解码及文件路由解析](packages/loader/README.md)
+- [@ainess/rpc 在同一 TCP 连接两端发起和处理二进制 RPC，支持单响应、流式传输和运行时注册](packages/rpc/README.md)
 
 ## 组合示例
 
 - [使用应用配置装配 HTTP 和 Controller 并启动监听器](README.md#通过配置启动)
 - [通过同一端口提供 Ainess API 和 Next.js 页面](packages/http-next/README.md#快速开始)
 - [在 HTTP 请求入口校验 Model 入参并调用领域方法](packages/model/README.md#从-http-调用-model)
+- [在 Cordis 中装配 TCP RPC](skills/ainess/references/assembly.md#接入-tcp-rpc)
