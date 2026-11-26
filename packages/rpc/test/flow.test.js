@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
-import { createConnection, createServer } from 'node:net'
+import { createConnection, createServer, Socket } from 'node:net'
 import test from 'node:test'
 import { RpcMode, RpcServer } from '@ainess/rpc'
+import { deferred } from '../dist/deferred.js'
 import { frame, openFrame } from '../dist/messages.js'
 import { MessageModem } from '../dist/modem.js'
-import { encodeHeader, encodeHello, FrameType, HEADER_SIZE, MAX_BODY, writeUint32 } from '../dist/wire.js'
+import { encodeHeader, encodeHello, FrameDecoder, FrameType, HEADER_SIZE, MAX_BODY, writeUint32 } from '../dist/wire.js'
 
 /**
  * @param {import('node:net').Socket} socket
@@ -21,10 +22,9 @@ const fullWindow = HEADER_SIZE + MAX_BODY
  * @param {import('node:test').TestContext} t
  * @param {'dialer' | 'acceptor'} [role]
  * @param {import('../dist/wire.js').Frame[]} [afterHello]
- * @param {number} [maxIncomingCalls]
  * @param {number} [streamWindow]
  */
-async function startModem(t, role = 'acceptor', afterHello = [], maxIncomingCalls, streamWindow = fullWindow) {
+async function startModem(t, role = 'acceptor', afterHello = [], streamWindow = fullWindow) {
   const listener = createServer()
   listener.listen(0, '127.0.0.1')
   await once(listener, 'listening')
@@ -45,7 +45,7 @@ async function startModem(t, role = 'acceptor', afterHello = [], maxIncomingCall
   const modem = new MessageModem(socket, role, value => {
     if (value.type === FrameType.Open) events.push('open')
     if (value.type === FrameType.Open || value.type === FrameType.StopInput) seenMarker()
-  }, () => {}, () => { events.push('ready') }, maxIncomingCalls)
+  }, () => {}, () => { events.push('ready') })
   t.after(async () => {
     peer.destroy()
     await modem.close()
@@ -53,21 +53,21 @@ async function startModem(t, role = 'acceptor', afterHello = [], maxIncomingCall
   })
 
   const hello = encodeHello()
-  hello.writeUInt32BE(fullWindow, 6)
-  hello.writeUInt32BE(streamWindow, 10)
-  hello.writeUInt32BE(fullWindow, 14)
+  hello.writeUInt32BE(fullWindow, 4)
+  hello.writeUInt32BE(streamWindow, 8)
+  hello.writeUInt32BE(fullWindow, 12)
   send(peer, frame(FrameType.Hello, 0, hello), ...afterHello)
   await modem.ready
   return { modem, peer, socket, marker, events }
 }
 
-test('a low call limit still allows a burst of control frames during socket backpressure', { timeout: 5_000 }, async t => {
-  const { modem, socket } = await startModem(t, 'acceptor', [], 1)
+test('drains more than 4096 queued control frames during socket backpressure', { timeout: 5_000 }, async t => {
+  const { modem, socket } = await startModem(t)
   modem.open(1, true)
   socket.cork()
   const data = modem.send(frame(FrameType.Data, 1, Buffer.alloc(MAX_BODY)))
   const backpressured = socket.writableNeedDrain
-  const controls = Array.from({ length: 8 }, (_, index) => modem.send(frame(FrameType.Cancel, 2 + index * 2)))
+  const controls = Array.from({ length: 4_608 }, (_, index) => modem.send(frame(FrameType.Cancel, 2 + index * 2)))
   socket.uncork()
 
   assert.equal(backpressured, true)
@@ -75,10 +75,93 @@ test('a low call limit still allows a burst of control frames during socket back
   assert.equal(modem.failure, undefined)
 })
 
+test('retiring a call drops all its queued controls and preserves the order of the others', {
+  timeout: 5_000,
+}, async t => {
+  const { modem, socket } = await startModem(t)
+  modem.open(1, true)
+  socket.cork()
+  const data = modem.send(frame(FrameType.Data, 1, Buffer.alloc(MAX_BODY)))
+  const backpressured = socket.writableNeedDrain
+  /** @type {number[]} */
+  const written = []
+  const controls = [
+    frame(FrameType.StopInput, 2),
+    frame(FrameType.Cancel, 4),
+    frame(FrameType.End, 2),
+    frame(FrameType.StopInput, 6),
+    frame(FrameType.End, 6),
+  ]
+  const results = Promise.allSettled(controls.map((value, index) => modem.send(value, () => { written.push(index) })))
+  modem.retire(2)
+  socket.uncork()
+
+  assert.equal(backpressured, true)
+  await data
+  const outcomes = await results
+  assert.deepEqual(written, [1, 3, 4])
+  assert.deepEqual(outcomes.map(outcome => outcome.status === 'rejected' ? outcome.reason.code : outcome.status),
+    ['CANCELLED', 'fulfilled', 'CANCELLED', 'fulfilled', 'fulfilled'])
+})
+
+test('cancelling a rejected call discards its queued error under socket backpressure', {
+  timeout: 5_000,
+}, async t => {
+  const handled = deferred()
+  const server = await RpcServer.listen({
+    host: '127.0.0.1',
+    port: 0,
+    methods: [{
+      name: 'known', mode: RpcMode.Unary,
+      handle() {
+        handled.resolve(undefined)
+        return Buffer.alloc(0)
+      },
+    }],
+  })
+  t.after(() => server.close())
+  const address = server.address
+  /** @type {Socket | undefined} */
+  let accepted
+  const keepAlive = Socket.prototype.setKeepAlive
+  /** @this {Socket} @param {boolean} [enable] @param {number} [idle] */
+  function captureSocket(enable, idle) {
+    if (this.localPort === address.port) {
+      accepted = this
+      const write = this.write
+      // Hold the modem in backpressure after it submits HELLO, until the test releases it.
+      t.mock.method(this, 'write', (/** @type {Uint8Array} */ bytes) => {
+        const written = write.call(this, bytes)
+        return bytes[8] === FrameType.Hello ? false : written
+      })
+    }
+    return keepAlive.call(this, enable, idle)
+  }
+  t.mock.method(Socket.prototype, 'setKeepAlive', captureSocket)
+
+  const peer = createConnection(address)
+  t.after(() => { peer.destroy() })
+  const decoder = new FrameDecoder()
+  const replied = deferred()
+  /** @type {number[]} */
+  const errors = []
+  peer.on('data', chunk => decoder.push(Buffer.from(chunk), ({ type, id }) => {
+    if (type === FrameType.Error) errors.push(id)
+    if (type === FrameType.End && id === 3) replied.resolve(undefined)
+  }))
+  send(peer, frame(FrameType.Hello, 0, encodeHello()),
+    openFrame(1, 'missing', Buffer.alloc(0)), frame(FrameType.Cancel, 1), openFrame(3, 'known', Buffer.alloc(0)))
+  await handled.promise
+  assert.ok(accepted)
+  accepted.emit('drain')
+  await replied.promise
+  assert.deepEqual(errors, [])
+})
+
 test('the minimum stream window admits a full upload and any usable reserve admits a reply', { timeout: 5_000 }, async t => {
   for (const role of /** @type {const} */ (['dialer', 'acceptor'])) {
     for (const extra of [0, HEADER_SIZE - 1, HEADER_SIZE]) {
-      const { modem, peer, socket } = await startModem(t, role, [], undefined, fullWindow + extra)
+      const { modem, peer, socket } = await startModem(t, role, [], fullWindow + extra)
       const first = role === 'dialer' ? 1 : 2
       const reply = role === 'dialer' ? 2 : 1
       modem.open(first, true)
@@ -137,6 +220,63 @@ test('shared DATA credit accumulates for the oldest stream with available call c
   send(peer, frame(FrameType.WindowUpdate, 0, writeUint32(smallCredit), 1))
   await newer
   assert.deepEqual(written, [3, 5])
+})
+
+test('queueing DATA without credit waits for a window update before scheduling writes', { timeout: 5_000 }, async t => {
+  const { modem, peer, socket } = await startModem(t)
+  modem.open(2, true)
+  await modem.send(frame(FrameType.Data, 2, Buffer.alloc(MAX_BODY)))
+  if (socket.writableNeedDrain) await once(socket, 'drain')
+
+  const cork = t.mock.method(socket, 'cork')
+  /** @type {number[]} */
+  const written = []
+  const ids = Array.from({ length: 64 }, (_, index) => 4 + index * 2)
+  const pending = Promise.all(ids.map(id => {
+    modem.open(id, true)
+    return modem.send(frame(FrameType.Data, id), () => { written.push(id) })
+  }))
+  void pending.catch(() => {})
+  assert.equal(cork.mock.callCount(), 0)
+  assert.deepEqual(written, [])
+
+  send(peer, frame(FrameType.WindowUpdate, 0, writeUint32(ids.length * HEADER_SIZE), 1))
+  await pending
+  assert.deepEqual(written, ids)
+})
+
+test('a blocked upload holds later uploads while a reply can pass', { timeout: 5_000 }, async t => {
+  const { modem, peer, socket, marker } = await startModem(t, 'acceptor', [], 2 * fullWindow)
+  modem.open(2, true)
+  modem.open(4, true)
+  modem.open(1, true)
+  await modem.send(frame(FrameType.Data, 2, Buffer.alloc(MAX_BODY)))
+  if (socket.writableNeedDrain) await once(socket, 'drain')
+
+  const older = modem.send(frame(FrameType.Data, 4, Buffer.alloc(MAX_BODY)))
+  void older.catch(() => {})
+  const ids = Array.from({ length: 64 }, (_, index) => 6 + index * 2)
+  const credit = (ids.length + 1) * HEADER_SIZE
+  send(peer, frame(FrameType.WindowUpdate, 0, writeUint32(credit), 1), frame(FrameType.StopInput, 4))
+  await marker
+
+  const cork = t.mock.method(socket, 'cork')
+  /** @type {number[]} */
+  const written = []
+  const pending = Promise.all(ids.map(id => {
+    modem.open(id, true)
+    return modem.send(frame(FrameType.Data, id), () => { written.push(id) })
+  }))
+  void pending.catch(() => {})
+  assert.equal(cork.mock.callCount(), 0)
+  assert.equal(written.length, 0)
+
+  await modem.send(frame(FrameType.Data, 1), () => { written.push(1) })
+  assert.deepEqual(written, [1])
+  modem.retire(4)
+  await assert.rejects(older, { code: 'CANCELLED' })
+  await pending
+  assert.deepEqual(written, [1, ...ids])
 })
 
 test('retiring a blocked unsent OPEN wakes the next eligible OPEN', { timeout: 5_000 }, async t => {

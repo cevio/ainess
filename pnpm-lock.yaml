@@ -307,6 +307,25 @@ importers:
         specifier: 14.0.6
         version: 14.0.6
 
+  packages/micro:
+    dependencies:
+      '@ainess/rpc':
+        specifier: workspace:*
+        version: link:../rpc
+    devDependencies:
+      '@ainess/framework':
+        specifier: workspace:*
+        version: link:../framework
+      '@ainess/registry-client':
+        specifier: workspace:*
+        version: link:../registry-client
+      '@ainess/registry-server':
+        specifier: workspace:*
+        version: link:../registry-server
+      '@deepseek-ai/cordis':
+        specifier: 'catalog:'
+        version: 4.1.0
+
   packages/model:
     dependencies:
       '@ainess/loader':
@@ -331,6 +350,44 @@ importers:
       typeorm:
         specifier: 1.1.3
         version: 1.1.3(ioredis@5.11.1)(sql.js@1.17.0)
+
+  packages/registry-client:
+    dependencies:
+      '@ainess/registry-shared':
+        specifier: workspace:*
+        version: link:../registry-shared
+      '@ainess/rpc':
+        specifier: workspace:*
+        version: link:../rpc
+    devDependencies:
+      '@ainess/framework':
+        specifier: workspace:*
+        version: link:../framework
+      '@ainess/registry-server':
+        specifier: workspace:*
+        version: link:../registry-server
+      '@deepseek-ai/cordis':
+        specifier: 'catalog:'
+        version: 4.1.0
+
+  packages/registry-server:
+    dependencies:
+      '@ainess/registry-shared':
+        specifier: workspace:*
+        version: link:../registry-shared
+      '@ainess/rpc':
+        specifier: workspace:*
+        version: link:../rpc
+    devDependencies:
+      '@deepseek-ai/cordis':
+        specifier: 'catalog:'
+        version: 4.1.0
+
+  packages/registry-shared:
+    dependencies:
+      '@ainess/rpc':
+        specifier: workspace:*
+        version: link:../rpc
 
   packages/rpc: {}
 

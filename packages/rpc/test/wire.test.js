@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { rpcPayloadLimit } from '@ainess/rpc'
+import { openFrame } from '../dist/messages.js'
 import {
   EMPTY,
   FrameDecoder,
@@ -28,6 +30,15 @@ const frames = [
 
 test('encodes the fixed 12-byte big-endian frame header', () => {
   assert.deepEqual([...encodeHeader(frames[0])], [0, 0, 0, 3, 1, 2, 3, 4, 2, 3, 0, 0])
+})
+
+test('reports the payload limit for a UTF-8 method name and full-size data frames', () => {
+  const method = '订单.查询'
+  const limit = rpcPayloadLimit(method)
+  assert.equal(rpcPayloadLimit(), MAX_BODY)
+  assert.equal(openFrame(1, method, Buffer.alloc(limit)).body.byteLength, MAX_BODY)
+  assert.throws(() => openFrame(1, method, Buffer.alloc(limit + 1)), { code: 'INVALID_ARGUMENT' })
+  assert.throws(() => rpcPayloadLimit(''), { code: 'INVALID_ARGUMENT' })
 })
 
 test('decodes all frames in order for every split of a coalesced TCP read', () => {
@@ -88,20 +99,21 @@ test('rejects invalid headers as soon as the header is complete', () => {
   }
 })
 
-test('HELLO round-trips valid receive limits and rejects incompatible or unsafe limits', () => {
+test('HELLO contains only a frame size and three credit windows', () => {
   const hello = encodeHello()
+  assert.equal(hello.byteLength, 16)
+  assert.deepEqual([0, 4, 8, 12].map(offset => hello.readUInt32BE(offset)), [
+    MAX_BODY, LIMITS.messageWindow, LIMITS.streamWindow, LIMITS.callWindow,
+  ])
   assert.deepEqual(decodeHello(hello), LIMITS)
   assert.throws(() => decodeHello(hello.subarray(1)))
-
-  const unilateralVersion = Buffer.from(hello)
-  unilateralVersion.writeUInt16BE(1, 0)
-  assert.throws(() => decodeHello(unilateralVersion), /Incompatible RPC HELLO/)
+  assert.throws(() => decodeHello(Buffer.concat([hello, Buffer.alloc(2)])), /Incompatible RPC HELLO/)
 
   const wrongBodySize = Buffer.from(hello)
-  wrongBodySize.writeUInt32BE(MAX_BODY - 1, 2)
+  wrongBodySize.writeUInt32BE(MAX_BODY - 1, 0)
   assert.throws(() => decodeHello(wrongBodySize))
 
-  for (const [offset, limit] of [[6, MAX_BODY], [10, 0xffffffff], [14, 0], [18, 0]]) {
+  for (const [offset, limit] of [[4, MAX_BODY], [8, 0xffffffff], [12, 0]]) {
     const invalid = Buffer.from(hello)
     invalid.writeUInt32BE(limit, offset)
     assert.throws(() => decodeHello(invalid))

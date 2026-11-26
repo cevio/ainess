@@ -58,10 +58,12 @@ try {
 
 | 入口 | 行为 |
 | --- | --- |
-| `RpcServer.listen({ host, port, methods?, onPeer?, maxConcurrentCalls? })` | 开始监听，返回 `Promise<RpcServer>`。可用端口 `0` 分配空闲端口，再从 `server.address` 读取地址。可通过 `methods` 在监听前预注册共享方法。`maxConcurrentCalls` 应用于每条接入连接。 |
+| `RpcServer.listen({ host, port, methods?, onPeer?, keepAliveInitialDelayMs?, signal? })` | 开始监听，返回 `Promise<RpcServer>`。可用端口 `0` 分配空闲端口，再从 `server.address` 读取地址。可通过 `methods` 在监听前预注册共享方法。`keepAliveInitialDelayMs` 应用于每条接入连接。`signal` 可取消启动并以 `CANCELLED` 拒绝。成功返回后的监听由 `server.close()` 关闭。 |
 | `onPeer(peer)` | 监听端在协议握手完成后同步调用，早于该连接首个入站调用的分派。首个调用所需的方法应在回调的同步部分注册。回调异常会关闭该连接。 |
 | `server.register({ name, mode, handle })` | 注册监听器共享方法，已有接入连接的后续调用也能使用。返回注销函数 `() => Promise<void>`。 |
-| `RpcPeer.connect({ host, port }, { signal?, methods?, maxConcurrentCalls? }?)` | 建立连接并等待协议握手，返回 `Promise<RpcPeer>`。连接和握手限时 10 秒。`methods` 在发送 `HELLO` 前注册，接入端可在 `onPeer` 中立即调用。可用 `signal` 取消连接和握手。 |
+| `RpcPeer.connect({ host, port }, { signal?, methods?, keepAliveInitialDelayMs? }?)` | 先拨通 TCP，再在同一个 socket 上初始化 RPC 并完成 `HELLO` 握手，返回 `Promise<RpcPeer>`。TCP 拨号和 RPC 握手共用 10 秒时限，可用 `signal` 取消任一阶段。`methods` 在发送 `HELLO` 前注册，接入端可在 `onPeer` 中立即调用。`keepAliveInitialDelayMs` 配置拨号端的首次探测。 |
+| `peer.remainingOutgoingCallIds` | 只读 `number`，表示此端点尚可分配的调用 ID 数量。ID 耗尽或连接开始关闭后为 `0`。 |
+| `rpcPayloadLimit(method?)` | 返回单帧可用的载荷字节数。传方法名时返回扣除 UTF-8 方法名及长度字段后的初始请求上限。省略方法名时返回单个流元素或单响应的上限。方法名无效时抛出 `INVALID_ARGUMENT`。 |
 | `peer.register({ name, mode, handle })` | 注册该端点的连接专属方法，返回注销函数 `() => Promise<void>`。 |
 | `peer.request(name, options?)` 或 `peer.request(name, data, options?)` | 按方法名立即发起调用，返回 `Promise<Uint8Array>`。 |
 | `peer.stream(name, options?)` 或 `peer.stream(name, data, options?)` | 返回一次性 `AsyncIterableIterator<Uint8Array>`，在首次读取时按方法名发起调用。 |
@@ -95,17 +97,25 @@ try {
 
 接收输入流或响应流时，每个迭代器最多允许一个等待中的 `next()`。使用 `for await...of` 会逐项读取。
 
-`options.signal` 中止整个调用，`options.timeoutMs` 接受 1 至 2,147,483,647 的整数，省略时不限时。流式调用的时限从首次读取时开始。调用方提前结束响应迭代时也会取消整个调用。网络断开或调用失败时，单响应 Promise 拒绝，流在读到失败时抛出错误。调用方可从 `RpcError.code` 获取错误代码。处理函数可抛出 `new RpcError(code, message?, options?)` 指定错误码。应用自行决定是否重试，超时或断线时对端可能已经执行了方法。
+`options.signal` 中止整个调用，以 `CANCELLED` 报告并在错误的 `cause` 保留信号原因。`options.timeoutMs` 接受 1 至 2,147,483,647 的整数，省略时不限时。流式调用的时限从首次读取时开始。调用方提前结束响应迭代时也会取消整个调用。网络断开或调用失败时，单响应 Promise 拒绝，流在读到失败时抛出错误。调用方可从 `RpcError.code` 获取错误代码。处理函数可抛出 `new RpcError(code, message?, options?)` 指定错误码。应用自行决定是否重试，超时或断线时对端可能已经执行了方法。
 
-包还导出 `Bytes`、`ByteStream`、`RpcAddress`、`RpcPeerOptions`、`RpcServerOptions`、`RpcCallOptions`、`RpcCall`、`RpcInput`、`RpcStreamingCall`、`RpcMethod`、`RpcErrorCode`、`RpcCloseInfo` 和 `RpcCloseReason` 类型。
+`options.onResponse` 在处理首个流响应数据或成功结束帧时同步调用一次。成功结束帧也包括单响应和正常空流。观察器按接收帧的顺序执行。
+
+`options.onFailure` 可为已经开始的调用观察一次失败。参数 `RpcCallFailure` 包含调用错误 `error`、来源 `source` 和可选的发送及响应状态。来源 `remote` 表示收到对端的错误帧，`transport` 表示连接终止或发送失败，`local` 表示本端取消、超时或输入失败。若 `OPEN` 已提交到本端 socket，`sentAt` 为提交时的本端 `performance.now()` 值，单位为毫秒。如果流在失败前收到过响应数据，`responseStarted` 为 `true`。
+
+终态观察器在本调用的响应或错误就绪后同步执行，随后取消仍在运行的本地上传。观察器的异常或拒绝由 RPC 忽略。调用开始前的参数校验和已取消状态，以及业务结果和调用错误，都通过返回的 Promise 或迭代器报告。
+
+包还导出 `Bytes`、`ByteStream`、`RpcAddress`、`RpcPeerOptions`、`RpcServerOptions`、`RpcCallOptions`、`RpcCallFailure`、`RpcCall`、`RpcInput`、`RpcStreamingCall`、`RpcMethod`、`RpcErrorCode`、`RpcCloseInfo` 和 `RpcCloseReason` 类型。
 
 同一个连接可以并发承载两个方向的调用。应用在卸载时关闭自己创建的拨号端点和监听器。需要关闭服务端已接入的某一条连接时，可以调用该连接的 `peer.close()`。如果在 Cordis 中创建连接，由创建资源的插件注册清理，并等待监听或握手完成后再提供给消费者。
 
-`maxConcurrentCalls` 默认 `256`，接受 `1` 至 `4096` 的整数，设置不合法时返回 `INVALID_ARGUMENT`。本端用它限制每条连接上的入站并发调用数，并通过 `HELLO` 公布该上限。发起调用时，出站并发上限取本端设置与对端公布的入站上限中的较小值。要在同一方向发起超过 `256` 个并发调用，两端都要提高该设置。达到上限时调用返回 `RESOURCE_EXHAUSTED`。
+同一连接上的在途调用数可随负载增长。字节窗口和 TCP 背压控制数据发送。排队的请求、正在执行的调用和未读完的流都会占用内存。调用方可用截止时间或取消信号结束等待。
+
+调用开始并分配 ID 时消耗一个 ID，每个 ID 在当前连接上只分配一次。连接池可通过 `remainingOutgoingCallIds` 决定何时排空和替换连接。调用 ID 耗尽后，通过该连接发起新调用会收到 `RESOURCE_EXHAUSTED`。
 
 ### 连接保活和关闭通知
 
-拨号端和接入端都启用 TCP KeepAlive，连接空闲 30 秒后由操作系统发送首次探测。实际发现断线的时间还取决于操作系统的探测间隔和次数。KeepAlive 探测 TCP 连接，调用方可通过 `timeoutMs` 限制等待 RPC 响应的时间。应用负责决定是否重连。 [Node.js TCP KeepAlive](https://nodejs.org/api/net.html#socketsetkeepalive)
+拨号端和接入端都启用 TCP KeepAlive，默认将首次探测的空闲阈值设为 30 秒。`keepAliveInitialDelayMs` 可设为 1,000 至 32,767,000 毫秒的整数。Node.js 将其向下取整到秒，再按平台限制应用。例如，Node.js 所用的 libuv 在 SmartOS 上把低于 10 秒的值上调到 10 秒。无效值使启动以 `INVALID_ARGUMENT` 拒绝。实际发现断线的时间取决于 TCP 的探测过程。调用方可通过 `timeoutMs` 限制等待 RPC 响应的时间，应用负责决定是否重连。 [Node.js TCP KeepAlive](https://nodejs.org/api/net.html#socketsetkeepalive) · [libuv 平台设置](https://github.com/nodejs/node/blob/v24.22.1/deps/uv/src/unix/tcp.c#L444-L480) · [Linux TCP 参数上限](https://github.com/torvalds/linux/blob/master/include/net/tcp.h)
 
 `peer.onClose(listener)` 在端点开始关闭并终止在途调用后异步通知，每个订阅最多收到一次。关闭后订阅也会异步收到该端点的最终通知。回调执行前可以取消订阅。监听器抛出异常或返回拒绝的 Promise 时，其他监听器仍会收到通知。
 
@@ -145,7 +155,7 @@ try {
 
 ## 传输协议
 
-一条 TCP 连接建立后双方交换 `HELLO`，公布版本与接收限额。调用 ID `0` 用于连接级帧。拨号端分配递增的奇数 ID，接入端独立分配递增的非零偶数 ID。ID 达到上限后可用新连接继续发起调用。所有整数采用大端序。每帧先写 12 字节头，再写消息体。
+一条 TCP 连接建立后双方交换 `HELLO`，公布单帧大小和接收窗口。调用 ID `0` 用于连接级帧。拨号端分配递增的奇数 ID，接入端独立分配递增的非零偶数 ID。ID 达到上限后可用新连接继续发起调用。所有整数采用大端序。每帧先写 12 字节头，再写消息体。
 
 | 帧头字段 | 长度 |
 | --- | --- |
@@ -159,7 +169,7 @@ try {
 
 | 帧 | 值 | 用途 |
 | --- | --- | --- |
-| `HELLO` | 1 | 交换版本和接收限额 |
+| `HELLO` | 1 | 交换单帧大小和接收窗口 |
 | `OPEN` | 2 | 以标志中的 `RpcMode` 开始调用 |
 | `DATA` | 3 | 一个流元素 |
 | `END_INPUT` | 4 | 正常结束上传 |
@@ -169,16 +179,14 @@ try {
 | `STOP_INPUT` | 8 | 提前停止上传 |
 | `CANCEL` | 9 | 取消整个调用 |
 
-`HELLO` 消息体为 22 字节，依次是 `u16` 协议版本和五个 `u32` 数值。
+`HELLO` 消息体固定为 16 字节，由下表所列的四个 `u32` 数值按顺序组成。握手要求两端采用这一消息布局，部署时请同步升级 Registry、RPC 服务和客户端。
 
 | 字段 | 本端公布的值 |
 | --- | --- |
-| 版本 | 2 |
 | 单帧消息体上限 | 65,536 字节 |
 | 连接级短消息窗口 | 1 MiB |
 | 连接级流式数据窗口 | 4 MiB |
 | 单调用流式窗口 | 262,192 字节，可容纳 4 个最大 `DATA` 帧 |
-| 每条连接的入站并发调用上限 | `maxConcurrentCalls`，默认 256 |
 
 各端的连接级接收窗口由这条连接上的调用共享。`OPEN` 和携带消息体的 `END` 占用短消息额度，剩余额度低于短消息窗口的四分之三时批量补回。`DATA` 同时占用连接级流式额度和单调用流式额度，包括帧头在内按字节计算。收端消费数据后累积待归还的流式额度。累积达到窗口的一半或剩余额度不足一个最大帧时尽快发送额度更新，其余情况使用 1 毫秒的定时器合并更新。`WINDOW_UPDATE` 携带一个 `u32` 增量。调用 ID 为 0 时，标志 0 归还短消息额度，标志 1 归还连接级流式额度。非零调用 ID 配合标志 0 归还对应调用的流式额度。
 
@@ -197,7 +205,7 @@ WS 使用 `ws` 8.23.0，原生掩码使用 `bufferutil` 4.2.0，gRPC 使用 `@gr
 ### 吞吐
 
 单响应场景做原样回传，并发数指同时等待结果的调用数。所有结果取三轮中位数，单轮测量 900 毫秒或 1.8 秒。
-Ainess 在 1,024 和 4,096 并发组分别将两端的 `maxConcurrentCalls` 配置为对应值。
+本节 Ainess 数据采集于取消在途请求数上限之前。1,024 和 4,096 并发组分别将当时两端的 `maxConcurrentCalls` 配置为对应值。
 gRPC 在 256 和 1,024 并发组分别设置相同的 HTTP/2 并发流上限。表中「—」表示对应场景未采集。
 
 | 场景 | Ainess | WS | WS + 原生掩码 | gRPC |

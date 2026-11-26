@@ -119,6 +119,74 @@ test('a failed handshake preserves its error when dial listener cleanup throws',
   })
 })
 
+test('a refused or cancelled TCP dial does not initialize RPC', { timeout: 5_000 }, async t => {
+  const keepalive = t.mock.method(Socket.prototype, 'setKeepAlive')
+  const listener = createServer(socket => socket.destroy())
+  listener.listen(0, '127.0.0.1')
+  await once(listener, 'listening')
+  const address = listener.address()
+  assert.ok(address && typeof address !== 'string')
+  const endpoint = { host: address.address, port: address.port }
+
+  try {
+    const controller = new AbortController()
+    const dial = RpcPeer.connect(endpoint, { signal: controller.signal })
+    controller.abort()
+    await assert.rejects(dial, { code: 'CANCELLED' })
+  } finally {
+    await new Promise(resolve => listener.close(() => resolve(undefined)))
+  }
+
+  await assert.rejects(RpcPeer.connect(endpoint), { code: 'UNAVAILABLE' })
+  assert.equal(keepalive.mock.callCount(), 0)
+})
+
+test('an abort while reading the address prevents TCP dialing', { timeout: 5_000 }, async t => {
+  const connect = t.mock.method(Socket.prototype, 'connect')
+  const controller = new AbortController()
+  const address = {
+    host: '127.0.0.1',
+    get port() {
+      controller.abort()
+      return 9
+    },
+  }
+
+  await assert.rejects(RpcPeer.connect(address, { signal: controller.signal }), { code: 'CANCELLED' })
+  assert.equal(connect.mock.callCount(), 0)
+})
+
+test('TCP dial and HELLO share one connection deadline', { timeout: 5_000 }, async t => {
+  const hello = latch()
+  let connections = 0
+  /** @type {Socket | undefined} */
+  let accepted
+  const listener = createServer(socket => {
+    connections++
+    accepted = socket
+    socket.on('error', () => {})
+    socket.once('data', hello.resolve)
+  })
+  listener.listen(0, '127.0.0.1')
+  await once(listener, 'listening')
+  const address = listener.address()
+  assert.ok(address && typeof address !== 'string')
+  t.after(() => {
+    accepted?.destroy()
+    return new Promise(resolve => listener.close(() => resolve(undefined)))
+  })
+
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const ready = RpcPeer.connect({ host: address.address, port: address.port })
+  const expired = assert.rejects(ready, { code: 'UNAVAILABLE', message: 'RPC handshake timed out' })
+  void expired.catch(() => {})
+  t.mock.timers.tick(9_000)
+  await hello.promise
+  t.mock.timers.tick(1_000)
+  await expired
+  assert.equal(connections, 1)
+})
+
 test('a single TCP connection accepts concurrent first calls in both directions', { timeout: 5_000 }, async t => {
   const toServerStarted = latch()
   const toClientStarted = latch()
@@ -420,6 +488,20 @@ test('TCP keepalive is enabled on both ends of a peer connection', { timeout: 5_
 
   assert.deepEqual(keepalive.mock.calls.map(call => call.arguments), [[true, 30_000], [true, 30_000]])
   assert.notEqual(keepalive.mock.calls[0].this, keepalive.mock.calls[1].this)
+})
+
+test('invalid TCP keepalive delays reject during RPC startup', { timeout: 5_000 }, async () => {
+  const host = '127.0.0.1'
+  for (const keepAliveInitialDelayMs of [999, 1_000.5, 32_768_000, NaN]) {
+    await assert.rejects(async () => {
+      const server = await RpcServer.listen({ host, port: 0, keepAliveInitialDelayMs })
+      await server.close()
+    }, { code: 'INVALID_ARGUMENT' })
+    await assert.rejects(
+      RpcPeer.connect({ host, port: 0 }, { keepAliveInitialDelayMs }),
+      { code: 'INVALID_ARGUMENT' },
+    )
+  }
 })
 
 test('close listeners are independent, fire once, and replay the reason to late subscribers', { timeout: 5_000 }, async t => {

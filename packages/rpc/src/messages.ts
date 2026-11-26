@@ -5,6 +5,7 @@ import type { Bytes, RpcErrorCode } from './types.js'
 import { EMPTY, FrameType, HEADER_SIZE, MAX_BODY } from './wire.js'
 import type { Frame } from './wire.js'
 
+const METHOD_LENGTH_BYTES = 1
 const errorCodes = [
   'CANCELLED',
   'DEADLINE_EXCEEDED',
@@ -67,25 +68,29 @@ export function methodNameLength(name: string): number {
   return length
 }
 
+export function rpcPayloadLimit(method?: string): number {
+  return method === undefined ? MAX_BODY : MAX_BODY - METHOD_LENGTH_BYTES - methodNameLength(method)
+}
+
 export function openFrame(id: number, name: string, data: Bytes, flags = 0): Frame {
   const length = methodNameLength(name)
-  const offset = 1 + length
+  const offset = METHOD_LENGTH_BYTES + length
   const payload = byteBody(data, offset)
   const packet = Buffer.allocUnsafe(HEADER_SIZE + offset + payload.length)
   const body = packet.subarray(HEADER_SIZE)
   body[0] = length
-  body.write(name, 1, length, 'utf8')
+  body.write(name, METHOD_LENGTH_BYTES, length, 'utf8')
   body.set(payload, offset)
   return { type: FrameType.Open, id, flags, body, packet }
 }
 
 export function readOpenBody(body: Buffer): { name: string; data: Buffer } {
   const length = body[0] ?? 0
-  const offset = 1 + length
+  const offset = METHOD_LENGTH_BYTES + length
   if (length === 0 || offset > body.length) invalidProtocol('Invalid RPC method name length')
-  const name = body.toString('utf8', 1, offset)
+  const name = body.toString('utf8', METHOD_LENGTH_BYTES, offset)
   // Invalid byte sequences decode to U+FFFD, which is also a valid name character.
-  if (name.includes('\ufffd') && !isUtf8(body.subarray(1, offset))) {
+  if (name.includes('\ufffd') && !isUtf8(body.subarray(METHOD_LENGTH_BYTES, offset))) {
     invalidProtocol('Invalid UTF-8 in RPC method name')
   }
   return { name, data: body.subarray(offset) }

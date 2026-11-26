@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
-import { createServer } from 'node:net'
 import test from 'node:test'
 import { RpcMode, RpcPeer, RpcServer } from '@ainess/rpc'
 
@@ -10,41 +9,10 @@ function latch() {
   return { promise, resolve: release }
 }
 
-test('negotiates more than 256 simultaneous calls on one TCP connection', { timeout: 5_000 }, async t => {
-  const count = 320
-  const entered = latch()
-  const release = latch()
-  let started = 0
-  const server = await RpcServer.listen({
-    host: '127.0.0.1',
-    port: 0,
-    maxConcurrentCalls: 384,
-    methods: [{
-      name: 'echo', mode: RpcMode.Unary,
-      async handle({ data }) {
-        if (++started === count) entered.resolve()
-        await release.promise
-        return data
-      },
-    }],
-  })
-  t.after(() => server.close())
-  const client = await RpcPeer.connect(server.address, { maxConcurrentCalls: 384 })
-  t.after(() => client.close())
-
-  const inputs = Array.from({ length: count }, (_, index) => Buffer.from(String(index)))
-  const results = Promise.all(inputs.map(input => client.request('echo', input)))
-  try {
-    await Promise.race([entered.promise, results])
-    assert.equal(started, count)
-  } finally {
-    release.resolve()
-  }
-  assert.deepEqual((await results).map(result => Buffer.from(result)), inputs)
-})
-
-test('uses the lower negotiated limit independently in both directions', { timeout: 5_000 }, async t => {
-  const limit = 3
+test('admits more than 4096 simultaneous calls in each direction on one TCP connection', {
+  timeout: 10_000,
+}, async t => {
+  const count = 4_608
   const entered = latch()
   const release = latch()
   const ready = latch()
@@ -53,9 +21,10 @@ test('uses the lower negotiated limit independently in both directions', { timeo
   let accepted
   /** @type {import('@ainess/rpc').RpcMethod} */
   const method = {
-    name: 'echo', mode: RpcMode.Unary,
+    name: 'echo',
+    mode: RpcMode.Unary,
     async handle({ data }) {
-      if (++started === limit * 2) entered.resolve()
+      if (++started === count * 2) entered.resolve()
       await release.promise
       return data
     },
@@ -63,7 +32,6 @@ test('uses the lower negotiated limit independently in both directions', { timeo
   const server = await RpcServer.listen({
     host: '127.0.0.1',
     port: 0,
-    maxConcurrentCalls: limit,
     methods: [method],
     onPeer(peer) {
       accepted = peer
@@ -71,27 +39,36 @@ test('uses the lower negotiated limit independently in both directions', { timeo
     },
   })
   t.after(() => server.close())
-  const client = await RpcPeer.connect(server.address, { maxConcurrentCalls: 384, methods: [method] })
+  const client = await RpcPeer.connect(server.address, { methods: [method] })
   t.after(() => client.close())
   await ready.promise
   assert.ok(accepted)
 
-  const payload = Buffer.from('ok')
-  const peers = [client, accepted]
-  const results = Promise.all(peers.flatMap(peer =>
-    Array.from({ length: limit }, () => peer.request('echo', payload))))
+  const inputs = Array.from({ length: count }, (_, index) => Buffer.from(index % 2 === 0 ? '' : String(index)))
+  const remote = accepted
+  const peers = [client, remote]
+  const firstIdBudgets = [0x80000000, 0x7fffffff]
+  assert.deepEqual(peers.map(peer => peer.remainingOutgoingCallIds), firstIdBudgets)
+  const results = Promise.all(peers.flatMap(peer => inputs.map(input => peer.request('echo', input))))
   try {
     await Promise.race([entered.promise, results])
-    assert.equal(started, limit * 2)
-    await Promise.all(peers.map(peer => assert.rejects(peer.request('echo', { timeoutMs: 250 }), {
-      code: 'RESOURCE_EXHAUSTED',
-    })))
+    assert.equal(started, count * 2)
   } finally {
     release.resolve()
   }
-  assert.deepEqual((await results).map(result => Buffer.from(result)), Array(limit * 2).fill(payload))
-  const reused = await Promise.all(peers.map(peer => peer.request('echo', payload)))
-  assert.deepEqual(reused.map(result => Buffer.from(result)), [payload, payload])
+  assert.deepEqual((await results).map(result => Buffer.from(result)), [...inputs, ...inputs])
+  const reply = Buffer.from('peer still usable')
+  assert.deepEqual(
+    (await Promise.all(peers.map(peer => peer.request('echo', reply)))).map(result => Buffer.from(result)),
+    [reply, reply],
+  )
+  assert.deepEqual(peers.map(peer => peer.remainingOutgoingCallIds), firstIdBudgets.map(budget => budget - count - 1))
+
+  const remoteClose = new Promise(resolve => remote.onClose(resolve))
+  const closing = client.close()
+  assert.equal(client.remainingOutgoingCallIds, 0)
+  await Promise.all([closing, remoteClose])
+  assert.equal(remote.remainingOutgoingCallIds, 0)
 })
 
 test('full-duplex uploads leave connection credit for streaming replies', { timeout: 8_000 }, async t => {
@@ -132,13 +109,12 @@ test('full-duplex uploads leave connection credit for streaming replies', { time
   }))
 })
 
-test('an upload abort listener can immediately reuse the only call slot', { timeout: 5_000 }, async t => {
+test('an upload abort listener can immediately start another call on the same peer', { timeout: 5_000 }, async t => {
   const receiving = latch()
   const uploading = latch()
   const server = await RpcServer.listen({
     host: '127.0.0.1',
     port: 0,
-    maxConcurrentCalls: 1,
     methods: [
       {
         name: 'upload',
@@ -153,7 +129,7 @@ test('an upload abort listener can immediately reuse the only call slot', { time
     ],
   })
   t.after(() => server.close())
-  const client = await RpcPeer.connect(server.address, { maxConcurrentCalls: 1 })
+  const client = await RpcPeer.connect(server.address)
   t.after(() => client.close())
   const controller = new AbortController()
   const payload = Buffer.from('reused')
@@ -179,11 +155,10 @@ test('an upload abort listener can immediately reuse the only call slot', { time
   assert.deepEqual(Buffer.from(echoed), payload)
 })
 
-test('returning a response iterator during lazy startup releases its call slot', { timeout: 5_000 }, async t => {
+test('returning a response iterator during lazy startup leaves the connection usable', { timeout: 5_000 }, async t => {
   const server = await RpcServer.listen({
     host: '127.0.0.1',
     port: 0,
-    maxConcurrentCalls: 1,
     methods: [
       {
         name: 'events', mode: RpcMode.ServerStream,
@@ -195,7 +170,7 @@ test('returning a response iterator during lazy startup releases its call slot',
     ],
   })
   t.after(() => server.close())
-  const client = await RpcPeer.connect(server.address, { maxConcurrentCalls: 1 })
+  const client = await RpcPeer.connect(server.address)
   t.after(() => client.close())
   const output = client.stream('events', {
     get timeoutMs() {
@@ -205,26 +180,6 @@ test('returning a response iterator during lazy startup releases its call slot',
   })
 
   assert.equal((await output.next()).done, true)
-  const payload = Buffer.from('slot released')
+  const payload = Buffer.from('connection still usable')
   assert.deepEqual(Buffer.from(await client.request('echo', payload)), payload)
-})
-
-test('rejects invalid call limits before connecting or binding', { timeout: 5_000 }, async t => {
-  let accepted = 0
-  const occupied = createServer(socket => {
-    accepted++
-    socket.destroy()
-  })
-  occupied.listen(0, '127.0.0.1')
-  await once(occupied, 'listening')
-  t.after(() => new Promise(resolve => occupied.close(() => resolve(undefined))))
-  const address = occupied.address()
-  assert.ok(address && typeof address !== 'string')
-  const endpoint = { host: '127.0.0.1', port: address.port }
-
-  for (const maxConcurrentCalls of [-1, 0, 1.5, 4097, NaN, Infinity]) {
-    await assert.rejects(RpcPeer.connect(endpoint, { maxConcurrentCalls }), { code: 'INVALID_ARGUMENT' })
-    await assert.rejects(RpcServer.listen({ ...endpoint, maxConcurrentCalls }), { code: 'INVALID_ARGUMENT' })
-  }
-  assert.equal(accepted, 0)
 })

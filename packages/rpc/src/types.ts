@@ -22,8 +22,17 @@ export interface RpcCloseInfo {
   readonly error: RpcError
 }
 
+export interface RpcCallFailure {
+  readonly error: RpcError
+  readonly source: 'remote' | 'transport' | 'local'
+  readonly sentAt?: number
+  readonly responseStarted?: boolean
+}
+
 export interface RpcCallOptions {
   input?: (signal: AbortSignal) => ByteStream
+  onFailure?: (failure: RpcCallFailure) => void
+  onResponse?: () => void
   signal?: AbortSignal
   timeoutMs?: number
 }

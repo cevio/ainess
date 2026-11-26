@@ -1,18 +1,19 @@
 import { createConnection } from 'node:net'
 import type { Socket } from 'node:net'
 import { observeAbort } from './abort.js'
+import { deferred } from './deferred.js'
 import { IncomingCalls } from './incoming.js'
 import { MethodRegistry } from './methods.js'
-import { MessageModem, resolveCallLimit } from './modem.js'
+import { HANDSHAKE_TIMEOUT_MS, MessageModem, resolveKeepAliveInitialDelay } from './modem.js'
 import { OutgoingCalls } from './outgoing.js'
 import { RpcError } from './types.js'
 import type { Bytes, RpcAddress, RpcCallOptions, RpcCloseInfo, RpcCloseReason, RpcMethod } from './types.js'
-import { LIMITS } from './wire.js'
+import { LIMITS, MAX_CALL_ID } from './wire.js'
 
 export interface RpcPeerOptions {
   signal?: AbortSignal
   methods?: readonly RpcMethod[]
-  maxConcurrentCalls?: number
+  keepAliveInitialDelayMs?: number
 }
 
 function cancelled(): RpcError {
@@ -30,7 +31,7 @@ export class RpcPeer {
     socket: Socket,
     role: 'dialer' | 'acceptor',
     private readonly methods: MethodRegistry,
-    maxCalls: number,
+    keepAliveInitialDelayMs: number,
     sharedMethods?: MethodRegistry,
     onPeer?: (peer: RpcPeer) => void,
     onClose?: () => void,
@@ -39,12 +40,13 @@ export class RpcPeer {
       const calls = this.#modem.isLocal(frame.id) ? this.#outgoing : this.#incoming
       calls.receive(frame, release)
     }, (error, reason) => {
+      // Queue close listeners before failure observers can schedule replacement calls.
+      this.#notifyClose(error, reason)
       this.methods.clear()
       this.#outgoing.closed(error)
       this.#incoming.closed(error)
       onClose?.()
-      this.#notifyClose(error, reason)
-    }, onPeer && (() => this.#notify(onPeer)), maxCalls)
+    }, onPeer && (() => this.#notify(onPeer)), keepAliveInitialDelayMs)
     this.#incoming = new IncomingCalls(this.#modem, this, methods, sharedMethods)
     this.#outgoing = new OutgoingCalls(this.#modem)
   }
@@ -52,26 +54,72 @@ export class RpcPeer {
   static async connect(address: RpcAddress, options?: RpcPeerOptions): Promise<RpcPeer> {
     const signal = options?.signal
     if (signal?.aborted) throw cancelled()
-    const maxCalls = resolveCallLimit(options?.maxConcurrentCalls)
-    const methods = new MethodRegistry()
-    for (const method of options?.methods ?? []) methods.register(method)
+    const keepAliveInitialDelayMs = resolveKeepAliveInitialDelay(options?.keepAliveInitialDelayMs)
+    let methods: MethodRegistry | undefined
+    for (const method of options?.methods ?? []) (methods ??= new MethodRegistry()).register(method)
 
     const socketOptions = { host: address.host, port: address.port, highWaterMark: LIMITS.callWindow }
+    if (signal?.aborted) throw cancelled()
     const socket = createConnection(socketOptions)
-    const peer = new RpcPeer(socket, 'dialer', methods, maxCalls)
+    const connected = deferred<void>()
+    const closed = deferred<void>()
+    let dialError: RpcError | undefined
+    let peer: RpcPeer | undefined
     let disposeAbort: (() => void) | undefined
+    const failDial = (error: RpcError) => {
+      dialError ??= error
+      connected.resolve()
+    }
+    const onConnect = () => connected.resolve()
+    const onError = (cause: Error) => failDial(new RpcError('UNAVAILABLE', cause.message, { cause }))
+    const disconnected = () => new RpcError('UNAVAILABLE', 'RPC peer disconnected')
+    const onClose = () => {
+      if (!dialError) failDial(disconnected())
+      closed.resolve()
+    }
+    const detach = () => {
+      socket.off('connect', onConnect)
+      socket.off('error', onError)
+      socket.off('close', onClose)
+    }
+    const stop = (error: RpcError, reason: RpcCloseReason = 'error') => {
+      if (peer) {
+        void peer.#modem.close(error, reason)
+        return
+      }
+      failDial(error)
+      socket.destroy()
+    }
+    socket.once('connect', onConnect)
+    socket.on('error', onError)
+    socket.once('close', onClose)
+    const deadline = setTimeout(
+      () => stop(new RpcError('UNAVAILABLE', 'RPC handshake timed out')),
+      HANDSHAKE_TIMEOUT_MS,
+    ).unref()
+
     try {
-      if (signal) disposeAbort = observeAbort(signal, () => {
-        void peer.#modem.close(cancelled(), 'local')
-      })
+      if (signal) disposeAbort = observeAbort(signal, () => stop(cancelled(), 'local'))
+      await connected.promise
+      if (dialError) throw dialError
+      if (signal?.aborted) throw cancelled()
+      if (socket.destroyed) throw disconnected()
+      peer = new RpcPeer(socket, 'dialer', methods ?? new MethodRegistry(), keepAliveInitialDelayMs)
+      detach()
       await peer.#modem.ready
       if (signal?.aborted) throw cancelled()
       if (peer.#modem.failure) throw peer.#modem.failure
       return peer
     } catch (error) {
-      await peer.close()
+      if (peer) await peer.close()
+      else {
+        socket.destroy()
+        await closed.promise
+      }
       throw error
     } finally {
+      clearTimeout(deadline)
+      if (!peer) detach()
       disposeAbort?.()
     }
   }
@@ -80,11 +128,17 @@ export class RpcPeer {
   static accept(
     socket: Socket,
     sharedMethods: MethodRegistry,
-    maxCalls: number,
+    keepAliveInitialDelayMs: number,
     onPeer: ((peer: RpcPeer) => void) | undefined,
     onClose: () => void,
   ): RpcPeer {
-    return new RpcPeer(socket, 'acceptor', new MethodRegistry(), maxCalls, sharedMethods, onPeer, onClose)
+    return new RpcPeer(socket, 'acceptor', new MethodRegistry(), keepAliveInitialDelayMs,
+      sharedMethods, onPeer, onClose)
+  }
+
+  get remainingOutgoingCallIds(): number {
+    if (this.#modem.failure) return 0
+    return Math.floor((MAX_CALL_ID - this.#modem.nextCallId) / 2) + 1
   }
 
   register(method: RpcMethod): () => Promise<void> {

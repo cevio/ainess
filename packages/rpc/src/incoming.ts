@@ -44,6 +44,8 @@ export class IncomingCalls {
     const call = this.#calls.get(id)
     if (!call) {
       if (id > this.modem.lastOpened(id)) invalidProtocol('Frame for an unopened RPC call')
+      // A method rejection may still have an ERROR queued under socket backpressure.
+      if (type === FrameType.Cancel) this.modem.retire(id)
       release()
       return
     }
@@ -64,15 +66,12 @@ export class IncomingCalls {
   #open({ id, flags, body }: Frame): void {
     const { name, data } = readOpenBody(body)
     const method = this.methods.get(name) ?? this.sharedMethods?.get(name)
-    const available = this.#calls.size < this.modem.maxIncomingCalls
-    this.modem.open(id, method?.mode === flags && available && flags !== RpcMode.Unary)
+    this.modem.open(id, method?.mode === flags && flags !== RpcMode.Unary)
 
-    if (!method || method.mode !== flags || !available) {
+    if (!method || method.mode !== flags) {
       const error = !method
         ? new RpcError('NOT_FOUND', `Unknown RPC method ${name}`)
-        : method.mode !== flags
-          ? new RpcError('INVALID_ARGUMENT', 'RPC call mode does not match its method')
-          : new RpcError('RESOURCE_EXHAUSTED', 'RPC connection reached its active call limit')
+        : new RpcError('INVALID_ARGUMENT', 'RPC call mode does not match its method')
       void this.modem.send(errorFrame(id, error)).catch(() => {})
       return
     }

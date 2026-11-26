@@ -18,7 +18,11 @@
 - [@ainess/typeorm 用 Cordis 管理 TypeORM DataSource、仓储和事务](packages/typeorm/README.md)
 - [@ainess/ioredis 用 Cordis 管理 Redis 单节点、Sentinel 或 Cluster](packages/ioredis/README.md)
 - [@ainess/loader 复用模块扫描、默认导出解码及文件路由解析](packages/loader/README.md)
-- [@ainess/rpc 在同一 TCP 连接两端发起和处理二进制 RPC，支持单响应、流式传输和运行时注册](packages/rpc/README.md)
+- [@ainess/rpc 在同一 TCP 连接两端发起和处理二进制 RPC，支持流式传输、运行时注册和调用结果观察](packages/rpc/README.md)
+- [@ainess/micro 通过可注入的发现接口选址，合并并发请求的拨号，复用业务 RPC 并处理实例熔断](packages/micro/README.md)
+- [@ainess/registry-server 提供服务登记、地址查询、支持排除地址的等权轮询选址和按连接清理](packages/registry-server/README.md)
+- [@ainess/registry-client 在一条 TCP 控制连接上登记和发现服务，重连时恢复登记](packages/registry-client/README.md)
+- [@ainess/registry-shared 维护 Registry RPC 协议和控制连接参数](packages/registry-shared/README.md)
 
 ## 组合示例
 
@@ -26,3 +30,5 @@
 - [通过同一端口提供 Ainess API 和 Next.js 页面](packages/http-next/README.md#快速开始)
 - [在 HTTP 请求入口校验 Model 入参并调用领域方法](packages/model/README.md#从-http-调用-model)
 - [在 Cordis 中装配 TCP RPC](skills/ainess/references/assembly.md#接入-tcp-rpc)
+- [在 Cordis 中装配 Registry、登记服务并直连业务 RPC](skills/ainess/references/assembly.md#通过-registry-发现服务)
+- [在 Cordis 中把 Registry 发现注入 Micro 并按服务名发起 RPC](skills/ainess/references/assembly.md#通过-micro-调用已登记服务)

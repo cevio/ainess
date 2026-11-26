@@ -1,3 +1,4 @@
+export { rpcPayloadLimit } from './messages.js'
 export { RpcPeer, RpcPeer as RpcClient } from './peer.js'
 export type { RpcPeerOptions } from './peer.js'
 export { RpcServer } from './server.js'
@@ -8,6 +9,7 @@ export type {
   ByteStream,
   RpcAddress,
   RpcCall,
+  RpcCallFailure,
   RpcCallOptions,
   RpcCloseInfo,
   RpcCloseReason,

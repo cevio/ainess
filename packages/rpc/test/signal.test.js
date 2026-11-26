@@ -6,14 +6,12 @@ import { deferred } from '../dist/deferred.js'
 
 /**
  * @param {import('node:test').TestContext} t
- * @param {number} limit
  * @param {import('@ainess/rpc').RpcMethod[]} [methods]
  */
-async function connect(t, limit, methods = []) {
+async function connect(t, methods = []) {
   const server = await RpcServer.listen({
     host: '127.0.0.1',
     port: 0,
-    maxConcurrentCalls: limit,
     methods: [{ name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data }, ...methods],
   })
   t.after(() => server.close())
@@ -22,30 +20,29 @@ async function connect(t, limit, methods = []) {
   return peer
 }
 
-for (const limit of [1, 2]) {
-  test(`abort signal registration safely re-enters with capacity ${limit}`, { timeout: 5_000 }, async t => {
-    const peer = await connect(t, limit)
-    const { signal } = new AbortController()
-    const add = signal.addEventListener
-    /** @type {Promise<Uint8Array> | undefined} */
-    let nested
-    t.mock.method(signal, 'addEventListener', function () {
-      nested = peer.request('echo', Buffer.from('nested'))
-      return Reflect.apply(add, signal, arguments)
-    })
-
-    const reply = peer.request('echo', Buffer.from('outer'), { signal })
-    assert.ok(nested)
-    if (limit === 1) await assert.rejects(reply, { code: 'RESOURCE_EXHAUSTED' })
-    else assert.equal(String(await reply), 'outer')
-    assert.equal(String(await nested), 'nested')
-    assert.equal(getEventListeners(signal, 'abort').length, 0)
+test('abort signal registration can re-enter RPC and allocate separate call IDs', { timeout: 5_000 }, async t => {
+  const peer = await connect(t)
+  const availableIds = peer.remainingOutgoingCallIds
+  const { signal } = new AbortController()
+  const add = signal.addEventListener
+  /** @type {Promise<Uint8Array> | undefined} */
+  let nested
+  t.mock.method(signal, 'addEventListener', function () {
+    nested = peer.request('echo', Buffer.from('nested'))
+    return Reflect.apply(add, signal, arguments)
   })
-}
+
+  const reply = peer.request('echo', Buffer.from('outer'), { signal })
+  assert.ok(nested)
+  assert.equal(String(await reply), 'outer')
+  assert.equal(String(await nested), 'nested')
+  assert.equal(peer.remainingOutgoingCallIds, availableIds - 2)
+  assert.equal(getEventListeners(signal, 'abort').length, 0)
+})
 
 test('aborting while registering the signal prevents the call from opening', { timeout: 5_000 }, async t => {
   let calls = 0
-  const peer = await connect(t, 1, [{
+  const peer = await connect(t, [{
     name: 'count', mode: RpcMode.Unary,
     handle() {
       calls++
@@ -66,8 +63,9 @@ test('aborting while registering the signal prevents the call from opening', { t
   assert.equal(getEventListeners(signal, 'abort').length, 0)
 })
 
-test('a registration error removes the listener and preserves the call slot', { timeout: 5_000 }, async t => {
-  const peer = await connect(t, 1)
+test('a registration error removes the listener and preserves the call ID', { timeout: 5_000 }, async t => {
+  const peer = await connect(t)
+  const availableIds = peer.remainingOutgoingCallIds
   const { signal } = new AbortController()
   const add = signal.addEventListener
   const failure = new Error('Abort listener tracing failed')
@@ -78,14 +76,15 @@ test('a registration error removes the listener and preserves the call slot', { 
 
   await assert.rejects(peer.request('echo', { signal }), error => error === failure)
   assert.equal(getEventListeners(signal, 'abort').length, 0)
-  const payload = Buffer.from('slot available')
+  assert.equal(peer.remainingOutgoingCallIds, availableIds)
+  const payload = Buffer.from('connection still usable')
   assert.deepEqual(await peer.request('echo', payload), payload)
 })
 
-test('abort signal disposal can reopen the only call slot after cancellation', { timeout: 5_000 }, async t => {
+test('abort signal disposal can start a new call after cancellation', { timeout: 5_000 }, async t => {
   /** @type {import('../dist/deferred.js').Deferred<void>} */
   const started = deferred()
-  const peer = await connect(t, 1, [{
+  const peer = await connect(t, [{
     name: 'wait', mode: RpcMode.Unary,
     async handle({ signal }) {
       started.resolve(undefined)
@@ -113,7 +112,7 @@ test('abort signal disposal can reopen the only call slot after cancellation', {
 })
 
 test('abort signal removal errors do not strand a completed call', { timeout: 5_000 }, async t => {
-  const peer = await connect(t, 1)
+  const peer = await connect(t)
   const { signal } = new AbortController()
   t.mock.method(signal, 'removeEventListener', () => {
     throw new Error('Abort listener tracing failed')
@@ -127,7 +126,7 @@ test('abort signal removal errors do not strand a completed call', { timeout: 5_
 })
 
 test('a reused abort signal accumulates no listeners when its removal hook is a no-op', { timeout: 5_000 }, async t => {
-  const peer = await connect(t, 1)
+  const peer = await connect(t)
   const { signal } = new AbortController()
   t.mock.method(signal, 'removeEventListener', () => {})
   const payload = Buffer.from('completed')

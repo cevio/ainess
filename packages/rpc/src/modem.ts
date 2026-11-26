@@ -5,7 +5,7 @@ import { frame, invalidProtocol } from './messages.js'
 import { RpcError } from './types.js'
 import type { RpcCloseReason } from './types.js'
 import {
-  decodeHello, encodeHeader, encodeHello, FrameDecoder, FrameType, HEADER_SIZE, LIMITS, MAX_BODY, MAX_CALLS, writeUint32,
+  decodeHello, encodeHeader, encodeHello, FrameDecoder, FrameType, HEADER_SIZE, LIMITS, MAX_BODY, writeUint32,
 } from './wire.js'
 import type { Frame, Limits } from './wire.js'
 
@@ -37,14 +37,21 @@ const NO_RELEASE = () => {}
 const CALL_FINISHED = new RpcError('CANCELLED', 'RPC call finished')
 const CREDIT_INTERVAL_MS = 1
 const MAX_INLINE_BODY = 4 * 1024
-const KEEP_ALIVE_INITIAL_DELAY_MS = 30_000
+const DEFAULT_KEEP_ALIVE_INITIAL_DELAY_MS = 30_000
+const MAX_KEEP_ALIVE_INITIAL_DELAY_MS = 32_767_000
 const MAX_FRAME_SIZE = HEADER_SIZE + MAX_BODY
 
-export function resolveCallLimit(limit = LIMITS.maxCalls): number {
-  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_CALLS) {
-    throw new RpcError('INVALID_ARGUMENT', `RPC maxConcurrentCalls must be an integer from 1 to ${MAX_CALLS}`)
+/** @internal */
+export const HANDSHAKE_TIMEOUT_MS = 10_000
+
+export function resolveKeepAliveInitialDelay(delay = DEFAULT_KEEP_ALIVE_INITIAL_DELAY_MS): number {
+  if (!Number.isInteger(delay) || delay < 1_000 || delay > MAX_KEEP_ALIVE_INITIAL_DELAY_MS) {
+    throw new RpcError(
+      'INVALID_ARGUMENT',
+      `RPC keepAliveInitialDelayMs must be an integer from 1000 to ${MAX_KEEP_ALIVE_INITIAL_DELAY_MS}`,
+    )
   }
-  return limit
+  return delay
 }
 
 function window(id: number, flags: number, available: number): ReceiveWindow {
@@ -81,7 +88,7 @@ export class MessageModem {
   #decoder = new FrameDecoder()
   #ready = deferred<void>()
   #closed = deferred<void>()
-  #handshake: NodeJS.Timeout
+  #handshake: NodeJS.Timeout | undefined
   #reason: RpcError | undefined
   #peer: Limits | undefined
   #localParity: 0 | 1
@@ -95,9 +102,10 @@ export class MessageModem {
   #credits = new Set<ReceiveWindow>()
   #creditTimer: NodeJS.Timeout | undefined
   #control = new Set<Pending>()
-  readonly #maxControls: number
+  #controlByCall = new Map<number, Set<Pending>>()
   #short = new Map<number, Pending>()
   #data = new Map<number, Pending>()
+  #blockedUpload: number | undefined
   #writable = true
   #flushing = false
   #readingBatch = false
@@ -110,14 +118,17 @@ export class MessageModem {
     private readonly receive: Receive,
     private readonly onClose: (error: RpcError, reason: RpcCloseReason) => void,
     private readonly onReady?: () => void,
-    readonly maxIncomingCalls = LIMITS.maxCalls,
+    keepAliveInitialDelayMs = DEFAULT_KEEP_ALIVE_INITIAL_DELAY_MS,
   ) {
     this.#localParity = role === 'dialer' ? 1 : 0
-    this.#maxControls = Math.max(LIMITS.maxCalls, maxIncomingCalls) * 4
-    this.#handshake = setTimeout(() => this.close(new RpcError('UNAVAILABLE', 'RPC handshake timed out')), 10_000)
-    this.#handshake.unref()
+    if (role === 'acceptor') {
+      this.#handshake = setTimeout(
+        () => this.close(new RpcError('UNAVAILABLE', 'RPC handshake timed out')),
+        HANDSHAKE_TIMEOUT_MS,
+      ).unref()
+    }
     void this.#ready.promise.catch(NO_RELEASE)
-    socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY_MS)
+    socket.setKeepAlive(true, keepAliveInitialDelayMs)
     socket.setNoDelay(true)
     socket.on('data', bytes => {
       try {
@@ -147,7 +158,7 @@ export class MessageModem {
       if (!this.#reason) this.close(new RpcError('UNAVAILABLE', 'RPC peer disconnected'), 'remote')
       this.#closed.resolve()
     })
-    this.#write(frame(FrameType.Hello, 0, encodeHello(maxIncomingCalls)))
+    this.#write(frame(FrameType.Hello, 0, encodeHello()))
   }
 
   get ready(): Promise<void> {
@@ -156,10 +167,6 @@ export class MessageModem {
 
   get failure(): RpcError | undefined {
     return this.#reason
-  }
-
-  get maxCalls(): number {
-    return Math.min(this.#peer?.maxCalls ?? 0, this.maxIncomingCalls)
   }
 
   get nextCallId(): number {
@@ -203,10 +210,13 @@ export class MessageModem {
     this.#calls.delete(id)
     const removedMessage = this.#drop(this.#short, id, error)
     const removedData = this.#drop(this.#data, id, error)
-    for (const pending of this.#control) {
-      if (pending.frame.id !== id) continue
-      this.#control.delete(pending)
-      pending.done.reject(error)
+    const controls = this.#controlByCall.get(id)
+    if (controls) {
+      this.#controlByCall.delete(id)
+      for (const pending of controls) {
+        this.#control.delete(pending)
+        pending.done.reject(error)
+      }
     }
     // A caller can enqueue CANCEL before resuming writes unblocked by retirement.
     if (removedMessage || removedData) queueMicrotask(() => this.#flush())
@@ -224,9 +234,7 @@ export class MessageModem {
       this.#sendShort -= bytes
     } else if (channel === 'data') {
       const call = this.#calls.get(value.id)
-      if (!call || this.#short.size || this.#data.size || bytes > call.outgoing) return false
-      const available = this.#sendData - (this.isLocal(value.id) ? this.#replyReserve : 0)
-      if (bytes > available) return false
+      if (!call || this.#short.size || this.#data.size || !this.#hasDataCredit(value.id, bytes, call)) return false
       this.#sendData -= bytes
       call.outgoing -= bytes
     }
@@ -242,19 +250,23 @@ export class MessageModem {
   send(value: Frame, written?: () => void): Promise<void> {
     if (this.#reason) return Promise.reject(this.#reason)
     const channel = lane(value)
-    if (channel === 'data' && !this.#calls.has(value.id)) return Promise.reject(CALL_FINISHED)
+    const call = channel === 'data' ? this.#calls.get(value.id) : undefined
+    if (channel === 'data' && !call) return Promise.reject(CALL_FINISHED)
     const pending = { frame: value, written, done: deferred<void>() }
     if (channel === 'control') {
-      if (this.#control.size >= this.#maxControls) {
-        const error = new RpcError('UNAVAILABLE', 'RPC control queue exceeded its limit')
-        this.close(error)
-        return Promise.reject(error)
-      }
       this.#control.add(pending)
+      let controls = this.#controlByCall.get(value.id)
+      if (!controls) this.#controlByCall.set(value.id, controls = new Set())
+      controls.add(pending)
     } else {
       const queue = channel === 'short' ? this.#short : this.#data
       if (queue.has(value.id)) return Promise.reject(new RpcError('INTERNAL', 'RPC writes were queued out of order'))
       queue.set(value.id, pending)
+    }
+    if (call) {
+      // A later upload waits behind the first one blocked by shared credit. A reply may pass it.
+      if (this.#blockedUpload !== undefined && this.isLocal(value.id)) return pending.done.promise
+      if (!this.#hasDataCredit(value.id, HEADER_SIZE + value.body.length, call)) return pending.done.promise
     }
     this.#flush()
     return pending.done.promise
@@ -277,8 +289,10 @@ export class MessageModem {
     for (const pending of this.#short.values()) pending.done.reject(error)
     for (const pending of this.#data.values()) pending.done.reject(error)
     this.#control.clear()
+    this.#controlByCall.clear()
     this.#short.clear()
     this.#data.clear()
+    this.#blockedUpload = undefined
     this.#credits.clear()
     this.#calls.clear()
     this.onClose(error, reason)
@@ -372,8 +386,13 @@ export class MessageModem {
     const pending = queue.get(id)
     if (!pending) return false
     queue.delete(id)
+    if (queue === this.#data && this.#blockedUpload === id) this.#blockedUpload = undefined
     pending.done.reject(error)
     return true
+  }
+
+  #hasDataCredit(id: number, bytes: number, call: CallWindow): boolean {
+    return bytes <= call.outgoing && bytes <= this.#sendData - (this.isLocal(id) ? this.#replyReserve : 0)
   }
 
   #flush(): void {
@@ -398,6 +417,10 @@ export class MessageModem {
     for (const pending of this.#control) {
       if (!this.#writable) break
       this.#control.delete(pending)
+      const { id } = pending.frame
+      const controls = this.#controlByCall.get(id)!
+      controls.delete(pending)
+      if (!controls.size) this.#controlByCall.delete(id)
       this.#writePending(pending)
     }
   }
@@ -425,7 +448,7 @@ export class MessageModem {
   }
 
   #flushData(): void {
-    let uploadsBlocked = false
+    this.#blockedUpload = undefined
     for (const [id, pending] of this.#data) {
       if (!this.#writable) break
       const call = this.#calls.get(id)!
@@ -433,8 +456,9 @@ export class MessageModem {
       if (bytes > call.outgoing) continue
       if (this.isLocal(id)) {
         // Keep enough credit for a reply even when uploads on both peers fill their windows.
-        if (uploadsBlocked || bytes > this.#sendData - this.#replyReserve) {
-          uploadsBlocked = true
+        if (this.#blockedUpload !== undefined) continue
+        if (bytes > this.#sendData - this.#replyReserve) {
+          this.#blockedUpload = id
           continue
         }
       } else if (bytes > this.#sendData) {

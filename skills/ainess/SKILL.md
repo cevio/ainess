@@ -1,6 +1,6 @@
 ---
 name: ainess
-description: 使用、组合和验证 Ainess 的公开能力。用于使用 @ainess/* 的应用、编写 ainess.config、装配 Cordis 服务与入口、用 CLI 启停应用、接入 HTTP Controller、Next.js、Model、TypeORM、Redis 或 TCP RPC，以及复用目录加载能力。
+description: 使用、组合和验证 Ainess 的公开能力。用于使用 @ainess/* 的应用、编写 ainess.config、装配 Cordis 服务与入口、用 CLI 启停应用、接入 HTTP Controller、Next.js、Model、TypeORM、Redis、TCP RPC、Micro 与 Registry 服务发现，以及复用目录加载能力。
 ---
 
 # 使用 Ainess
@@ -12,6 +12,7 @@ description: 使用、组合和验证 Ainess 的公开能力。用于使用 @ain
 - **启动**。应用选择 `framework` 或直接使用 Cordis。在启动 `httpListener` 前，等待选定的 `http`、`models`、数据库和 Redis 等服务，以及 Controller 和领域方法装配。`framework` 按 `plugins` 和 `entries` 两阶段执行。通过命令启动框架应用时，由 `cli` 加载配置并调用框架的生命周期接口。
 - **请求**。`httpListener` 把 API 请求交给 `http`。Controller 校验外部输入，通过声明的注入键调用 Model。Model 方法按需注入 `typeorm` 或 `ioredis`，并复用对应的客户端。需要 Next.js 时，用 `http-next` 在同一个监听器上把页面请求交给 Next.js。
 - **目录**。`http/controllers` 和 `model/loader` 复用 `loader` 扫描和导入文件，由各自的插件处理业务定义、注册和卸载。应用可选择显式注册或使用对应的目录插件。
+- **服务发现**。提供方等业务 RPC 监听就绪，再通过 `registry-client` 向 `registry-server` 登记地址。消费方可将 `ctx.registryClient.discovery` 注入 `micro`，合并选址和建连，按服务名复用业务 RPC 连接。 [Registry 与 Micro 装配](references/assembly.md#通过-micro-调用已登记服务)
 - **关闭**。先停止入口并等在途响应，接着卸载消费方和领域方法，最后关闭其依赖的数据库与 Redis。独立 Cordis 宿主负责按这个顺序等待 Fiber，框架应用调用 `running.stop()`。
 
 完整的请求链示例随技能安装。 [HTTP → Model → SQLite 装配](references/assembly.md)
@@ -52,9 +53,31 @@ description: 使用、组合和验证 Ainess 的公开能力。用于使用 @ain
 
 ### `@ainess/rpc`
 
-用 `RpcServer.listen({ host, port, onPeer })` 开始监听，用 `RpcPeer.connect({ host, port }, { methods })` 建连并等待握手。拨号和接入的两端共享一条 TCP 连接，都可发起和处理调用。监听端在 `onPeer` 取得接入端点，处理函数通过上下文的 `peer` 发起同连接反向调用。用 `peer.register()` 注册连接专属方法，用 `server.register()` 注册监听器共享方法。连接专属方法优先于同名共享方法。返回的注销函数立即移除该注册，并等待它已接收的调用清理。任一端可用 `request(name, options?)` 接收单响应，用 `stream(name, options?)` 接收流。发送初始数据时，在方法名和选项之间传入 `Uint8Array`。提供 `options.input` 开启上传流，上传源应响应自己的 `AbortSignal`。处理方可通过 `input.stop()` 只停止上传方向。业务对象由应用编解码，结束时等待端点和监听器的 `close()`。 [Cordis 装配示例](references/assembly.md#接入-tcp-rpc) · [RPC 手册](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md)
+用 `RpcServer.listen({ host, port, onPeer, signal })` 开始监听。可选的 `signal` 用于取消监听启动。`RpcPeer.connect({ host, port }, { methods, signal })` 先拨通 TCP，再用同一个 socket 初始化 RPC 并完成握手。两阶段共用 10 秒时限，可通过 `signal` 取消。连接两端都可发起和处理调用。监听端在 `onPeer` 取得接入端点，处理函数通过上下文的 `peer` 发起同连接反向调用。用 `peer.register()` 注册连接专属方法，用 `server.register()` 注册监听器共享方法。连接专属方法优先于同名共享方法。返回的注销函数立即移除该注册，并等待它已接收的调用清理。任一端可用 `request(name, options?)` 接收单响应，用 `stream(name, options?)` 接收流。发送初始数据时，在方法名和选项之间传入 `Uint8Array`。提供 `options.input` 开启上传流，上传源应响应自己的 `AbortSignal`。处理方可通过 `input.stop()` 只停止上传方向。业务对象由应用编解码，结束时等待端点和监听器的 `close()`。 [Cordis 装配示例](references/assembly.md#接入-tcp-rpc) · [RPC 手册](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md)
 
-两端启用 TCP KeepAlive。对任一端点使用 `peer.onClose(listener)` 订阅一次异步关闭通知，已关闭的端点也会通知新订阅。监听器接收 `RpcCloseInfo` 的 `reason` 和 `error`，返回的取消订阅函数由调用方管理。应用可在通知时从连接表移除端点，并自行安排重连。 [连接保活和关闭通知](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#连接保活和关闭通知)
+连接双方通过 16 字节 `HELLO` 交换帧大小与接收窗口，后续通过字节窗口和 TCP 背压调度传输。两端启用 TCP KeepAlive，初始空闲阈值默认为 30 秒。监听端和拨号端都可用 `keepAliveInitialDelayMs` 设置本端的阈值，实际探测受平台限制。对任一端点使用 `peer.onClose(listener)` 订阅一次异步关闭通知，已关闭的端点也会通知新订阅。监听器接收 `RpcCloseInfo` 的 `reason` 和 `error`，返回的取消订阅函数由调用方管理。应用可在通知时从连接表移除端点，并自行安排重连。 [传输协议](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#传输协议) · [连接保活和关闭通知](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#连接保活和关闭通知)
+
+调用选项 `onResponse` 可观察首个成功响应，`onFailure` 可观察已开始调用的失败来源、本端 `OPEN` 提交时间和流式响应是否已开始。由调用信号取消时，RPC 错误的 `cause` 保留信号原因。调用方通过 Promise 或迭代器接收调用结果。 [RPC 调用选项](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#发起调用)
+
+按大小分批编码时使用 `rpcPayloadLimit(method?)` 取得当前协议的载荷上限。传方法名计算初始请求的可用字节数，省略时计算单个流元素或单响应的上限。 [RPC 接口](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#接口)
+
+### `@ainess/registry-server`
+
+独立运行服务注册中心。用 `RegistryServer.listen({ host, port }, { signal })` 打开监听，第二个参数用于可选的启动取消。读取 `server.address` 并在退出时等待 `server.close()`。Cordis 应用在 `entries` 传入 `use(registryServer, { host, port })`，启动完成后从 `running.ctx.registryServer.address` 获取监听地址，应用停止时由插件关闭。登记归提交它的连接，断线时清理该连接的登记。多个连接可以登记同一个服务地址，查询按地址去重。 [Registry 服务端手册](https://github.com/cevio/ainess/blob/main/packages/registry-server/README.md)
+
+### `@ainess/registry-client`
+
+用 `RegistryClient.connect(address, options?)` 连接 Registry，或在 `plugins` 中用 `use(registry, { address })` 装配。消费插件声明 `inject: ['registryClient']` 并使用 `ctx.registryClient.discovery`。业务监听器开始接收请求后，用 `register({ services, host, port })` 登记可拨号的地址。用 `unregister({ services, host, port })` 注销指定服务，或关闭控制连接以清理该连接的全部登记。`list({ service })` 读取完整地址列表，`pick({ service, exclude? }, { signal }?)` 在单个请求帧内提交服务名和可选的排除地址。Registry 按等权轮询选择一个地址，无可选实例时返回 `null`。可选的 `signal` 取消该次选址。消费方用单独的 RPC 连接直连选出的地址。首次连接失败由启动方处理。运行期断线后，客户端等待退避结束和旧控制 socket 关闭，再拨号并恢复仍有效的已确认登记。短暂恢复后再次断开会延续退避。恢复期间，查询和新的注册返回 `UNAVAILABLE`。 [Registry 客户端手册](https://github.com/cevio/ainess/blob/main/packages/registry-client/README.md) · [注册与直连示例](references/assembly.md#通过-registry-发现服务)
+
+### `@ainess/registry-shared`
+
+用于实现兼容的 Registry RPC 端点或协议测试。复用 `registryMethods`、请求和响应类型、消息编解码与校验。两端通过 `registryKeepAliveInitialDelayMs` 将控制连接的 TCP KeepAlive 初始空闲阈值配置为 5 秒。应用业务调用通过 `@ainess/registry-client` 进行。 [Registry 共享协议手册](https://github.com/cevio/ainess/blob/main/packages/registry-shared/README.md)
+
+### `@ainess/micro`
+
+使用 `createMicroClient({ discovery })` 或 Cordis 插件 `micro`。应用可以在声明 `inject: ['registryClient']` 的装配插件中调用 `micro(ctx, { discovery: ctx.registryClient.discovery })`。业务插件声明 `inject: ['micro']`，从 `ctx.micro` 调用 `request(service, method, data?, options?)` 或 `stream(service, method, data?, options?)`。同服务的首次并发调用共享选址，同地址共享拨号和可用连接。Micro 按需建立业务连接，RPC 用字节窗口调度同一连接上的请求。建连失败时使用 `exclude` 再选一次。Micro 通过 `pick(query, options?)` 的 `options.signal` 传递共享选址取消。停止时由 `micro` 等待业务连接关闭，发现对象由应用托管。 [Micro 手册](https://github.com/cevio/ainess/blob/main/packages/micro/README.md) · [Registry 与 Micro 装配](references/assembly.md#通过-micro-调用已登记服务)
+
+Micro 默认按服务和地址记录业务熔断。打开熔断后跳过该实例，另选地址时用 `exclude`。冷却后用单个实际业务调用试探，已发出的调用独立结束。应用可用 `circuitBreaker` 配置阈值，或传 `false` 关闭业务熔断。 [Micro 业务熔断](https://github.com/cevio/ainess/blob/main/packages/micro/README.md#业务熔断)
 
 ## 开发和验证
 

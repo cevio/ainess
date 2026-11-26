@@ -233,6 +233,144 @@ try {
 }
 ```
 
-运行 `node rpc.mjs` 会输出 `hello`。`app.start()` 等待 RPC 监听就绪，`RpcPeer.connect()` 等待握手，监听端在分派首个入站调用前执行 `onPeer`。问候处理函数通过上下文的 `peer` 反向调用 `demo.message`，并用 `signal` 传递取消信号。长期使用的端点由其调用方或创建它的插件复用并在退出时关闭。 [同连接反向调用与双向流](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#快速开始)
+运行 `node rpc.mjs` 会输出 `hello`。`app.start()` 等待 RPC 监听就绪。`RpcPeer.connect()` 先拨通 TCP，再在同一条连接上完成 RPC 握手。监听端在分派首个入站调用前执行 `onPeer`。问候处理函数通过上下文的 `peer` 反向调用 `demo.message`，并用 `signal` 传递取消信号。长期使用的端点由其调用方或创建它的插件复用并在退出时关闭。 [同连接反向调用与双向流](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#快速开始)
 
 插件若维护活跃连接表，可在 `onPeer` 中记录端点，并用 `peer.onClose(() => { peers.delete(peer) })` 在关闭时移除。拨号端可以用同一个接口接收异步关闭通知，按 `reason` 处理本端关闭、对端正常关闭和错误，并在应用层安排重连。 [连接保活和关闭通知](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#连接保活和关闭通知)
+
+## 通过 Registry 发现服务
+
+宿主提供 `@ainess/registry-server`、`@ainess/registry-client`、`@ainess/rpc`、`@ainess/framework` 和 `@deepseek-ai/cordis`。将下例保存为 `registry.mjs`，用 `node registry.mjs` 验证业务 RPC 直连。
+
+```js
+import { defineApp, use } from '@ainess/framework'
+import { RegistryClient, registry } from '@ainess/registry-client'
+import { registryServer } from '@ainess/registry-server'
+import { RpcMode, RpcPeer, RpcServer } from '@ainess/rpc'
+
+const host = '127.0.0.1'
+const directory = await defineApp({
+  entries: { registryServer: use(registryServer, { host, port: 0 }) },
+}).start()
+
+let provider
+let publisher
+let consumer
+let peer
+try {
+  const address = directory.ctx.registryServer.address
+  provider = await RpcServer.listen({
+    host,
+    port: 0,
+    methods: [{
+      name: 'orders.health',
+      mode: RpcMode.Unary,
+      handle: () => new TextEncoder().encode('ready'),
+    }],
+  })
+  publisher = await RegistryClient.connect(address)
+  await publisher.discovery.register({ ...provider.address, services: ['orders'] })
+
+  consumer = await defineApp({ plugins: { registry: use(registry, { address }) } }).start()
+  const endpoint = await consumer.ctx.registryClient.discovery.pick({ service: 'orders' })
+  if (!endpoint) throw new Error('No address registered for orders')
+
+  peer = await RpcPeer.connect(endpoint)
+  const reply = await peer.request('orders.health', { timeoutMs: 5_000 })
+  console.log(new TextDecoder().decode(reply))
+} finally {
+  await peer?.close()
+  await consumer?.stop()
+  await publisher?.close()
+  await provider?.close()
+  await directory.stop()
+}
+```
+
+示例输出 `ready`。部署时将 Registry、服务提供方和调用方置于各自的进程，给 Registry 客户端配置可拨号的 Registry 地址，并在提供方登记调用方可访问的业务地址。`pick()` 只选址，业务连接由调用方持有和关闭。重复发起业务请求时可以复用已经建立的 `RpcPeer`。
+
+再次选址时可用 `discovery.pick({ service: 'orders', exclude: [endpoint] })` 跳过已知地址。排除按主机名和端口精确匹配，只作用于这次选址。无可选实例时返回 `null`。
+
+一个业务监听器可通过 `services` 登记多个服务。业务计划下线时，可以先调用 `unregister({ services, host, port })` 撤销相应登记，再关闭监听器。关闭 Registry 客户端也会让服务端清理该控制连接的登记。应用托管的 `registry` 和 `registryServer` 插件均随 `running.stop()` 关闭。 [服务端手册](https://github.com/cevio/ainess/blob/main/packages/registry-server/README.md) · [客户端手册](https://github.com/cevio/ainess/blob/main/packages/registry-client/README.md)
+
+## 通过 Micro 调用已登记服务
+
+宿主提供 `@ainess/framework`、`@deepseek-ai/cordis`、`@ainess/registry-server`、`@ainess/registry-client`、`@ainess/rpc` 和 `@ainess/micro`。将下例保存为 `micro-registry.mjs`，运行 `node micro-registry.mjs`。
+
+```js
+import { defineApp, use } from '@ainess/framework'
+import { micro } from '@ainess/micro'
+import { registry } from '@ainess/registry-client'
+import { RegistryServer } from '@ainess/registry-server'
+import { RpcMode, RpcServer } from '@ainess/rpc'
+
+const host = '127.0.0.1'
+const directory = await RegistryServer.listen({ host, port: 0 })
+const address = directory.address
+let provider
+let consumer
+
+try {
+  provider = await defineApp({
+    plugins: { registry: use(registry, { address }) },
+    entries: {
+      orders: use({
+        inject: ['registryClient'],
+        /** @param {import('@deepseek-ai/cordis').Context} ctx */
+        async apply(ctx) {
+          const discovery = ctx.registryClient.discovery
+          await ctx.effect(async () => {
+            const server = await RpcServer.listen({
+              host,
+              port: 0,
+              methods: [{ name: 'orders.echo', mode: RpcMode.Unary, handle: ({ data }) => data }],
+            })
+            const registration = { ...server.address, services: ['orders'] }
+            try {
+              await discovery.register(registration)
+            } catch (error) {
+              await server.close()
+              throw error
+            }
+            return async () => {
+              try {
+                await discovery.unregister(registration)
+              } finally {
+                await server.close()
+              }
+            }
+          })
+        },
+      }),
+    },
+  }).start()
+
+  const running = await defineApp({
+    plugins: {
+      registry: use(registry, { address }),
+      micro: use({
+        inject: ['registryClient'],
+        /** @param {import('@deepseek-ai/cordis').Context} ctx */
+        apply(ctx) {
+          return micro(ctx, { discovery: ctx.registryClient.discovery })
+        },
+      }),
+    },
+  }).start()
+  consumer = running
+
+  const replies = await Promise.all(['first', 'second'].map(value =>
+    running.ctx.micro.request('orders', 'orders.echo', new TextEncoder().encode(value)),
+  ))
+  console.log(replies.map(reply => new TextDecoder().decode(reply)))
+} finally {
+  try {
+    await Promise.all([consumer?.stop(), provider?.stop()])
+  } finally {
+    await directory.close()
+  }
+}
+```
+
+示例输出 `['first', 'second']`。提供方在业务监听就绪后登记地址，停机时注销并关闭监听器。调用方的两个请求共用首次选址和拨号，各自独立发送 RPC。业务连接由 `micro` 管理，控制连接由 `registry` 管理。应用也可直接传入满足 `MicroDiscovery.pick()` 契约的其他发现实现。 [Micro 手册](https://github.com/cevio/ainess/blob/main/packages/micro/README.md)
+
+Micro 默认对持续失败的服务实例熔断。打开熔断后优先复用同服务其他实例的连接，需要发现时向 `pick()` 传 `exclude`。业务调用发出后由调用方消费结果或错误。应用可以在示例的 `micro(ctx, options)` 中传入 `circuitBreaker` 配置。 [熔断选项](https://github.com/cevio/ainess/blob/main/packages/micro/README.md#业务熔断)
