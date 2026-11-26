@@ -40,7 +40,7 @@ try {
 }
 ```
 
-应用使用 Registry 时先连接注册中心，再传入已就绪的 `registryClient.discovery`。Cordis 应用在装配插件中声明 `inject: ['registryClient']`，将该发现对象传给 `micro(ctx, options)`。业务插件通过 `inject: ['micro']` 从 `ctx.micro` 获取客户端。应用停止时等待根 Fiber 清理。 [Registry 与 Micro 装配示例](../../skills/ainess/references/assembly.md#通过-micro-调用已登记服务)
+应用使用 Registry 时先连接注册中心，再传入已就绪的 `registryClient.discovery`。Cordis 应用在装配插件中声明 `inject: ['registryClient']`，将该发现对象传给 `micro(ctx, options)`。业务插件通过 `inject: ['micro']` 从 `ctx.micro` 获取客户端。应用停止时等待根 Fiber 清理。 [Registry 与 Micro 装配示例](../../skills/ainess/references/micro.md)
 
 ## 公开接口
 

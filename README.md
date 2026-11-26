@@ -73,11 +73,11 @@ export default () => ({
 
 ## 组合使用
 
-- Controller 可以把校验后的输入交给 Model，Model 方法通过自己的 `inject` 获取 TypeORM 或其他业务依赖。 [HTTP 调用 Model](packages/model/README.md#从-http-调用-model)
-- 需要同一个端口提供 API 和页面时，在当前的 `httpListener` 入口传入 `prepare: httpNext(...)`，并按项目需要选择前缀分流或共享 Koa 中间件。 [Next.js 装配示例](packages/http-next/README.md#快速开始)
-- 应用可以用 `RpcServer` 监听端口，用 `RpcPeer` 建立 TCP RPC 连接。连接两端都能调用对方的方法，传输通过字节窗口和 TCP 背压调度。Registry 和业务 RPC 的连接两端须使用相同的 `HELLO` 布局。Cordis 应用可由创建连接的插件托管其生命周期。 [RPC 协议](packages/rpc/README.md#传输协议) · [Cordis 装配示例](skills/ainess/references/assembly.md#接入-tcp-rpc)
-- 先启动 Registry 服务端和业务 RPC 监听器，再用 Registry 客户端登记服务。消费方通过 `discovery.pick({ service, exclude? })` 取得一个地址，直接建立业务 RPC 连接。 [注册、发现和直连示例](skills/ainess/references/assembly.md#通过-registry-发现服务)
-- 调用方可把 `ctx.registryClient.discovery` 注入 `micro`，再通过 `ctx.micro.request()` 按服务名调用。同服务的并发调用合并选址，业务连接按地址复用，熔断时跳过对应的服务实例。 [Registry 与 Micro 装配示例](skills/ainess/references/assembly.md#通过-micro-调用已登记服务)
+- Controller 可以把校验后的输入交给 Model，Model 方法通过自己的 `inject` 获取 TypeORM 或其他业务依赖。 [HTTP、Model 和 TypeORM 装配示例](skills/ainess/references/http.md#运行-httpmodel-和-typeorm)
+- 需要同一个端口提供 API 和页面时，在当前的 `httpListener` 入口传入 `prepare: httpNext(...)`，并按项目需要选择前缀分流或共享 Koa 中间件。 [Next.js 装配示例](skills/ainess/references/http-next.md)
+- 应用可以用 `RpcServer` 监听端口，用 `RpcPeer` 建立 TCP RPC 连接。连接两端都能调用对方的方法，传输通过字节窗口和 TCP 背压调度。Registry 和业务 RPC 的连接两端须使用相同的 `HELLO` 布局。Cordis 应用可由创建连接的插件托管其生命周期。 [RPC 协议](packages/rpc/README.md#传输协议) · [Cordis 装配示例](skills/ainess/references/rpc.md)
+- 先启动 Registry 服务端和业务 RPC 监听器，再用 Registry 客户端登记服务。消费方通过 `discovery.pick({ service, exclude? })` 取得一个地址，直接建立业务 RPC 连接。 [注册、发现和直连示例](skills/ainess/references/registry-client.md)
+- 调用方可把 `ctx.registryClient.discovery` 注入 `micro`，再通过 `ctx.micro.request()` 按服务名调用。同服务的并发调用合并选址，业务连接按地址复用，熔断时跳过对应的服务实例。 [Registry 与 Micro 装配示例](skills/ainess/references/micro.md)
 
 ## 安装 Agent 技能
 
@@ -87,4 +87,4 @@ export default () => ({
 npx skills add cevio/ainess --skill ainess
 ```
 
-测试本地版本时，将 `cevio/ainess` 换成 Ainess 仓库的本地路径。技能说明各包用法、包间关系和注意事项，并附可运行的应用示例。 [技能源码](skills/ainess/SKILL.md) · [Skills CLI 安装说明](https://github.com/vercel-labs/skills/blob/main/docs/commands.md#skills-add)
+测试本地版本时，将 `cevio/ainess` 换成 Ainess 仓库的本地路径。安装后从技能索引选择包，可直接读取该包的接入参考和可运行示例。 [技能索引](skills/ainess/SKILL.md#选择包) · [Skills CLI 安装说明](https://github.com/vercel-labs/skills/blob/main/docs/commands.md#skills-add)

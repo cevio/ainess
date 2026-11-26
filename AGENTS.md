@@ -19,6 +19,7 @@
 
 - 项目技能只从本仓库的 `.agents/skills/` 选用。先读 `SKILL.md`，再按需读取参考资料，并从技能的本地目录定位随附脚本。缺少匹配技能时，依据当前代码、官方文档和现有工具继续。
 - 面向应用开发者分发的 Ainess 技能维护在 [`skills/ainess/`](skills/ainess/SKILL.md)。技能为 AI 说明每个包的选用条件、公开入口、接入步骤、包间关系和注意事项，并随安装提供可运行的跨包装配示例。技能和包手册按同一套公开契约维护，新增或修改包时同步核对。技能所需的示例和参考可直接在安装目录内读取。修改技能时用 `npx skills add` 验证发现、安装和随附参考。
+- 技能参考按包维护在 `skills/ainess/references/<包名>.md`。跨包示例放在负责接入流程的包下，其他包通过相对链接引用。
 - 增删改可执行源码或测试前，先阅读 `.agents/skills/andrej-karpathy-perspective/SKILL.md` 和 `.agents/skills/solid/SKILL.md`，采用适合变更的工程方法。只读调查、纯文档和运行现有测试按任务选用技能。
 
 ## 单一来源与简洁实现

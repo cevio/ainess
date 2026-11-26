@@ -5,7 +5,7 @@
 ## 开发指引
 
 - [仓库工程约定和包文档规则](AGENTS.md)
-- [可安装的 ainess 技能与应用开发流程](skills/ainess/SKILL.md)
+- [可安装的 ainess 技能和包级接入参考](skills/ainess/SKILL.md#选择包)
 - [工作区环境和验证命令](README.md#本地验证)
 
 ## 包文档
@@ -27,8 +27,8 @@
 ## 组合示例
 
 - [使用应用配置装配 HTTP 和 Controller 并启动监听器](README.md#通过配置启动)
-- [通过同一端口提供 Ainess API 和 Next.js 页面](packages/http-next/README.md#快速开始)
-- [在 HTTP 请求入口校验 Model 入参并调用领域方法](packages/model/README.md#从-http-调用-model)
-- [在 Cordis 中装配 TCP RPC](skills/ainess/references/assembly.md#接入-tcp-rpc)
-- [在 Cordis 中装配 Registry、登记服务并直连业务 RPC](skills/ainess/references/assembly.md#通过-registry-发现服务)
-- [在 Cordis 中把 Registry 发现注入 Micro 并按服务名发起 RPC](skills/ainess/references/assembly.md#通过-micro-调用已登记服务)
+- [通过同一端口提供 Ainess API 和 Next.js 页面](skills/ainess/references/http-next.md)
+- [在 HTTP 请求入口校验 Model 入参并查询 SQLite](skills/ainess/references/http.md#运行-httpmodel-和-typeorm)
+- [在 Cordis 中装配 TCP RPC](skills/ainess/references/rpc.md)
+- [在 Cordis 中装配 Registry、登记服务并直连业务 RPC](skills/ainess/references/registry-client.md)
+- [在 Cordis 中把 Registry 发现注入 Micro 并按服务名发起 RPC](skills/ainess/references/micro.md)
