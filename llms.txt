@@ -10,10 +10,13 @@
 
 ## 包文档
 
-- [@ainess/framework 应用配置、Cordis 插件与入口装配、启动回滚和清理](packages/framework/README.md)
+- [@ainess/framework 配置对象与配置工厂、Cordis 插件与入口装配、启动回滚和清理](packages/framework/README.md)
 - [@ainess/cli ainess 命令、ESM 配置加载和进程信号](packages/cli/README.md)
 - [@ainess/http Koa 中间件、HTTP 路由、Controller 目录和请求取消](packages/http/README.md)
 - [@ainess/http-next 同一监听器上的 Ainess API、Next.js 和开发态重启](packages/http-next/README.md)
+- [@ainess/websocket WebSocket 服务端路由、文件装配、方法与事件、流和中间件](packages/websocket/README.md)
+- [@ainess/websocket-client 浏览器和 Node.js 的原生连接、命名调用和自动重连](packages/websocket-client/README.md)
+- [@ainess/websocket-shared WebSocket 模式枚举、帧协议和流辅助逻辑](packages/websocket-shared/README.md)
 - [@ainess/model 带类型的领域方法、服务注入、目录装配和类型生成](packages/model/README.md)
 - [@ainess/typeorm 用 Cordis 管理 TypeORM DataSource、仓储和事务](packages/typeorm/README.md)
 - [@ainess/ioredis 用 Cordis 管理 Redis 单节点、Sentinel 或 Cluster，并提供租约锁、限流和幂等](packages/ioredis/README.md)
@@ -28,6 +31,9 @@
 
 - [使用应用配置装配 HTTP 和 Controller 并启动监听器](README.md#通过配置启动)
 - [通过同一端口提供 Ainess API 和 Next.js 页面](skills/ainess/references/http-next.md)
+- [用同一份 WebSocket 路由独立监听或挂载到 HTTP](skills/ainess/references/websocket.md#运行两种入口)
+- [用 .ws 文件装配端点、调用方法与上传流](skills/ainess/references/websocket.md#按文件装配命名端点)
+- [使用 WebSocket 客户端并在重连后恢复订阅](skills/ainess/references/websocket-client.md)
 - [在 HTTP 请求入口校验 Model 入参并查询 SQLite](skills/ainess/references/http.md#运行-httpmodel-和-typeorm)
 - [在 Cordis 中装配 TCP RPC](skills/ainess/references/rpc.md)
 - [在 Cordis 中装配 Registry、登记服务并直连业务 RPC](skills/ainess/references/registry-client.md)

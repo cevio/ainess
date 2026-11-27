@@ -1,0 +1,45 @@
+{
+  "name": "@ainess/websocket",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./http": {
+      "types": "./dist/http.d.ts",
+      "default": "./dist/http.js"
+    },
+    "./loader": {
+      "types": "./dist/loader.d.ts",
+      "default": "./dist/loader.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@ainess/loader": "workspace:^",
+    "@ainess/websocket-shared": "workspace:^",
+    "@standard-schema/spec": "1.1.0",
+    "ws": "8.23.0"
+  },
+  "peerDependencies": {
+    "@ainess/http": "workspace:^",
+    "@deepseek-ai/cordis": "catalog:"
+  },
+  "peerDependenciesMeta": {
+    "@ainess/http": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@ainess/http": "workspace:^",
+    "@ainess/websocket-client": "workspace:^",
+    "@deepseek-ai/cordis": "catalog:",
+    "@types/ws": "8.18.2"
+  }
+}

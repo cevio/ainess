@@ -10,6 +10,9 @@ Ainess 是一个基于 `@deepseek-ai/cordis` 的 TypeScript ESM monorepo。Cordi
 | [@ainess/cli](packages/cli/README.md) | 通过 `ainess` 命令加载配置、启动应用及处理退出信号。 |
 | [@ainess/http](packages/http/README.md) | 接入 Koa 中间件、路由、Controller 及监听器。 |
 | [@ainess/http-next](packages/http-next/README.md) | 通过同一监听器提供 Ainess API 和 Next.js 页面。 |
+| [@ainess/websocket](packages/websocket/README.md) | 注册或按目录装配 WebSocket 端点，提供命名方法、事件、流和中间件。 |
+| [@ainess/websocket-client](packages/websocket-client/README.md) | 在浏览器或 Node.js 中调用 WebSocket 方法、消费流、收发事件并自动重连。 |
+| [@ainess/websocket-shared](packages/websocket-shared/README.md) | 维护服务端与客户端共用的模式枚举、JSON 帧和流辅助逻辑。 |
 | [@ainess/model](packages/model/README.md) | 定义、加载和调用类型化领域方法，生成声明和构建清单。 |
 | [@ainess/typeorm](packages/typeorm/README.md) | 注入原生 TypeORM 数据源。 |
 | [@ainess/ioredis](packages/ioredis/README.md) | 注入原生 Redis 单节点、Sentinel 或 Cluster 客户端，并复用连接执行租约锁、限流和幂等操作。 |
@@ -31,7 +34,7 @@ pnpm install
 pnpm test
 ```
 
-`pnpm test` 构建工作区、检查测试类型，并运行真实 HTTP、Next.js、TCP RPC、Registry 注册发现与内存 SQLite 测试。本机有支持 Unix socket 的 `redis-server` 时，测试会验证 Redis 单节点的读写、重连和关闭顺序。同时装有 `redis-cli` 时，还会用三个 Redis 主节点验证集群路由。
+`pnpm test` 构建工作区、检查测试类型，并运行真实 HTTP、Next.js、WebSocket、TCP RPC、Registry 注册发现与内存 SQLite 测试。本机有支持 Unix socket 的 `redis-server` 时，测试会验证 Redis 单节点的读写、重连和关闭顺序。同时装有 `redis-cli` 时，还会用三个 Redis 主节点验证集群路由。
 
 ## 通过配置启动
 
@@ -71,10 +74,13 @@ export default () => ({
 
 `use()` 使用原生 Cordis 插件及其配置。所有 `plugins` 激活后，应用才挂载 `entries`，并等待全部入口激活后报告启动成功。省略 `startupTimeoutMs` 时持续等待就绪。关闭时入口先排空，根 Context 再释放服务。 [应用装配与生命周期](packages/framework/README.md)
 
+`defineApp()` 也接受同步或异步配置工厂。Framework 在每次 `start()` 时读取工厂返回的配置，再启动插件和入口。 [配置工厂示例](packages/framework/README.md#配置工厂)
+
 ## 组合使用
 
 - Controller 可以把校验后的输入交给 Model，Model 方法通过自己的 `inject` 获取 TypeORM 或其他业务依赖。 [HTTP、Model 和 TypeORM 装配示例](skills/ainess/references/http.md#运行-httpmodel-和-typeorm)
 - 需要同一个端口提供 API 和页面时，在当前的 `httpListener` 入口传入 `prepare: httpNext(...)`，并按项目需要选择前缀分流或共享 Koa 中间件。 [Next.js 装配示例](skills/ainess/references/http-next.md)
+- 使用 `websocketRoutes()` 按 `.ws` 文件装配命名端点，通过客户端收发事件、调用方法和传输流。用 `websocketListener` 启动独立端口，或把 `websocketHttp` 装入 HTTP 应用。 [WebSocket 端到端示例](skills/ainess/references/websocket.md#按文件装配命名端点)
 - 应用可以用 `RpcServer` 监听端口，用 `RpcPeer` 建立 TCP RPC 连接。连接两端都能调用对方的方法，传输通过字节窗口和 TCP 背压调度。Registry 和业务 RPC 的连接两端须使用相同的 `HELLO` 布局。Cordis 应用可由创建连接的插件托管其生命周期。 [RPC 协议](packages/rpc/README.md#传输协议) · [Cordis 装配示例](skills/ainess/references/rpc.md)
 - 先启动 Registry 服务端和业务 RPC 监听器，再用 Registry 客户端登记服务。消费方通过 `discovery.pick({ service, exclude? })` 取得一个地址，直接建立业务 RPC 连接。 [注册、发现和直连示例](skills/ainess/references/registry-client.md)
 - 业务入口可用 `@ainess/micro/controllers` 从目录加载 RPC 方法，传给 `RpcServer.listen()` 后向 Registry 登记。调用方把 `ctx.registryClient.discovery` 注入 `micro`，再通过 `ctx.micro.request()` 按服务名调用。 [目录加载、登记、调用与清理示例](skills/ainess/references/micro.md#通过-micro-调用已登记服务)

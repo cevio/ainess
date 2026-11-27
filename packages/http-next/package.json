@@ -23,6 +23,7 @@
     "react-dom": "^19.3.1"
   },
   "devDependencies": {
+    "@ainess/websocket": "workspace:^",
     "@deepseek-ai/cordis": "catalog:",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",

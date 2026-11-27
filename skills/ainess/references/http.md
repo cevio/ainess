@@ -8,6 +8,8 @@
 
 等路由装配后再启动 `httpListener`，用 `ctx.http.address()` 取得实际监听地址。来自 `@ainess/http/request-signal` 的 `getHttpRequestSignal()` 会在客户端提前断开时中止。在请求内将信号传给支持取消的下游。使用 Next.js 回退时，在命中的 API 路由内解析请求体。 [Next.js 分流与关闭](http-next.md)
 
+协议适配器通过 `ctx.http.registerUpgrade(handle)` 或 `PreparedHttp.onUpgrade` 参加共享 Upgrade 分发。同步返回 `true` 接管连接，返回 `false` 转交下一处理方。新增处理器从下一次 Upgrade 生效，分发会跳过已撤销的处理器。受管分发独占 Node Server 的 `'upgrade'` 事件。监听器排空时中止 `HttpUpgrade.signal`，接管方可在总关闭期限内发送协议关闭帧。业务 WebSocket 应用使用 `websocketHttp`。 [同端口 WebSocket](websocket.md#运行两种入口)
+
 ## 运行 HTTP、Model 和 TypeORM
 
 宿主提供 `@ainess/framework`、`@ainess/http`、`@ainess/model`、`@ainess/typeorm`、`@deepseek-ai/cordis`、`typeorm` 和 `sql.js`。通过命令启动时，在同一应用中安装 `@ainess/cli`。这组 `.mjs` 文件使用内存 SQLite 验证端到端请求。

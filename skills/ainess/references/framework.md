@@ -2,6 +2,8 @@
 
 在应用的 ESM 配置中默认导出 `defineApp({ plugins, entries })`，各项用 `use(plugin, options)` 包装原生 Cordis 插件。提供者、Model 和路由注册放在 `plugins`，监听器放在 `entries`。同组依赖通过 `inject` 声明。用 `app.start({ signal })` 等待就绪，可通过 `signal` 取消等待。省略 `startupTimeoutMs` 时持续等待就绪。启动取消或失败会清理已挂载的资源，关闭已启动实例用 `await running.stop()`。 [framework 手册](https://github.com/cevio/ainess/blob/main/packages/framework/README.md)
 
+配置也可通过 `defineApp(() => ({ plugins, entries }))` 或 `defineApp(async ({ signal }) => ...)` 生成。工厂在每次启动时执行，接收可选信号，可将它传给配置 I/O。配置校验通过后开始装配，`startupTimeoutMs` 从此时计时。 [配置工厂示例](https://github.com/cevio/ainess/blob/main/packages/framework/README.md#配置工厂)
+
 ## 声明应用
 
 宿主提供 `@ainess/framework`、`@deepseek-ai/cordis` 和示例使用的 `@ainess/http`。将以下内容保存为 `ainess.config.mjs`。框架等 HTTP 服务和路由就绪后再启动监听器。

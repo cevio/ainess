@@ -44,13 +44,36 @@ try {
 
 从命令行运行这份配置时，使用 [@ainess/cli](../cli/README.md)。
 
+## 配置工厂
+
+配置可以由同步或异步函数返回。同步函数适合在每次启动时重新读取环境变量。异步函数可以先读取配置文件，再返回插件和入口的配置。
+
+在应用目录创建内容为 `3000` 的 `port.txt`。以下配置可保存为 `ainess.config.mjs`，通过 `ainess start` 启动。
+
+```js
+import { readFile } from 'node:fs/promises'
+import { defineApp, use } from '@ainess/framework'
+import { http, httpListener } from '@ainess/http'
+
+export default defineApp(async ({ signal }) => {
+  const port = Number(await readFile(new URL('./port.txt', import.meta.url), { encoding: 'utf8', signal }))
+  return {
+    plugins: { http: use(http) },
+    entries: { web: use(httpListener, { host: '127.0.0.1', port }) },
+  }
+})
+```
+
+`start({ signal })` 在调用时执行工厂一次，接收该次启动的可选 `signal`。异步工厂会等待结果返回，再按现有规则校验配置。工厂抛错或返回非法值会让 `start()` 拒绝。启动中止会取消等待并丢弃随后返回的配置。将 `signal` 传给工厂内的 I/O 可以同时取消该操作。工厂返回的 `startupTimeoutMs` 从配置校验通过后开始计时，覆盖 `plugins` 和 `entries` 的装配。需要为配置准备和装配设置同一个期限时，可以调用 `app.start({ signal: AbortSignal.timeout(5_000) })`。
+
 ## 公开接口
 
 从 `@ainess/framework` 导入以下接口和类型。
 
 | 接口 | 契约 |
 | --- | --- |
-| `defineApp(config: AppConfig): AppDefinition` | 检查配置并返回可启动的应用定义。非法字段或安装项立即报错。 |
+| `defineApp(config: AppConfig \| AppConfigFactory): AppDefinition` | 返回可启动的定义。对象参数在定义时检查，工厂返回的配置在每次启动时检查。 |
+| `AppConfigFactory`、`AppStartOptions` | 工厂接收只读的启动选项，返回 `AppConfig` 或 `PromiseLike<AppConfig>`。启动选项可传 `signal`。 |
 | `use(plugin, options?)` | 将原生 `Context.plugin()` 的参数转成 `PluginEntry`，插件的配置类型保留在调用处。 |
 | `PluginEntry` | `mount(ctx): Fiber` 把插件挂载到传入的 Context。自定义安装项每次须返回该 Context 下新挂载的直接子 Fiber。 |
 | `AppDefinition.start({ signal }?)` | 等待应用就绪，返回 `Promise<RunningApp>`。`signal` 可取消启动。 |
@@ -75,4 +98,4 @@ try {
 
 ## 验证
 
-在仓库根目录运行 `pnpm test`，或执行 `pnpm build` 后运行 `node --test packages/framework/test/framework.test.js`。应用装配测试覆盖真实 HTTP 和内存 SQLite、多入口排空及启动回滚。类型用例随根测试检查。 [装配测试](test/framework.test.js) · [类型用例](test/types.ts)
+在仓库根目录运行 `pnpm test`，或执行 `pnpm build` 后运行 `node --test packages/framework/test/framework.test.js`。应用装配测试覆盖配置工厂、真实 HTTP 和内存 SQLite、多入口排空及启动回滚。类型用例随根测试检查。 [装配测试](test/framework.test.js) · [类型用例](test/types.ts)

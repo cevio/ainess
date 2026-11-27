@@ -1,3 +1,4 @@
+import { addAbortListener } from 'node:events'
 import type { Context, Fiber, Plugin } from '@deepseek-ai/cordis'
 import { startApp, type ConfiguredPlugin } from './start.js'
 
@@ -11,8 +12,14 @@ export interface AppConfig {
   startupTimeoutMs?: number
 }
 
+export interface AppStartOptions {
+  signal?: AbortSignal
+}
+
+export type AppConfigFactory = (options: Readonly<AppStartOptions>) => AppConfig | PromiseLike<AppConfig>
+
 export interface AppDefinition {
-  start(options?: { signal?: AbortSignal }): Promise<RunningApp>
+  start(options?: AppStartOptions): Promise<RunningApp>
 }
 
 export interface RunningApp {
@@ -26,7 +33,35 @@ export function use<P extends Plugin>(...args: Parameters<typeof register<P>>): 
   return { mount: (ctx) => ctx.plugin<P>(...args) }
 }
 
-export function defineApp(config: AppConfig): AppDefinition {
+export function defineApp(config: AppConfig | AppConfigFactory): AppDefinition {
+  if (typeof config === 'function') {
+    return {
+      async start({ signal } = {}) {
+        const resolved = await resolveConfig(config, signal)
+        signal?.throwIfAborted()
+        return startApp(readConfig(resolved), signal)
+      },
+    }
+  }
+  const plan = readConfig(config)
+  return { start: ({ signal } = {}) => startApp(plan, signal) }
+}
+
+async function resolveConfig(factory: AppConfigFactory, signal?: AbortSignal): Promise<AppConfig> {
+  if (!signal) return factory({})
+  signal.throwIfAborted()
+  let abort: ReturnType<typeof addAbortListener> | undefined
+  try {
+    return await new Promise<AppConfig>((resolve, reject) => {
+      abort = addAbortListener(signal, () => reject(signal.reason))
+      void Promise.resolve(factory({ signal })).then(resolve, reject)
+    })
+  } finally {
+    abort?.[Symbol.dispose]()
+  }
+}
+
+function readConfig(config: AppConfig) {
   if (!isRecord(config)) throw new TypeError('App config must be an object')
   for (const key of Object.keys(config)) {
     if (key !== 'plugins' && key !== 'entries' && key !== 'startupTimeoutMs') {
@@ -38,12 +73,11 @@ export function defineApp(config: AppConfig): AppDefinition {
     && (!Number.isInteger(startupTimeoutMs) || startupTimeoutMs < 1 || startupTimeoutMs > 2_147_483_647)) {
     throw new RangeError('startupTimeoutMs must be an integer from 1 to 2147483647')
   }
-  const plan = {
+  return {
     plugins: readGroup(config.plugins, 'plugins'),
     entries: readGroup(config.entries, 'entries'),
     startupTimeoutMs,
   }
-  return { start: ({ signal } = {}) => startApp(plan, signal) }
 }
 
 function isRecord(value: unknown): boolean {

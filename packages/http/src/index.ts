@@ -3,11 +3,18 @@ import { Service, type Context, type Disposable } from '@deepseek-ai/cordis'
 import findMyWay from 'find-my-way'
 import Koa from 'koa'
 import compose from 'koa-compose'
-import { createListener, type HttpHandler, type HttpListenerOptions } from './listener.js'
+import { createListener, type HttpHandler, type HttpListenerOptions, type HttpUpgradeHandler } from './listener.js'
 import { findRoute, registerHttpRoute, registerRoute, type HttpRouter } from './route.js'
 
 export { defineController, type HttpControllerInput, type HttpControllerOptions } from './controller.js'
-export type { HttpHandler, HttpListenerOptions, HttpPrepare, PreparedHttp } from './listener.js'
+export type {
+  HttpHandler,
+  HttpListenerOptions,
+  HttpPrepare,
+  HttpUpgrade,
+  HttpUpgradeHandler,
+  PreparedHttp,
+} from './listener.js'
 
 export type HttpMethod = findMyWay.HTTPMethod
 export type HttpRouteMiddleware = Koa.Middleware<Koa.DefaultState, { params: Record<string, string | undefined> }>
@@ -30,6 +37,7 @@ function canUseRouteFallback(request: Koa.Context): boolean {
 class Http extends Service {
   private readonly handle: HttpHandler
   private readonly middleware = new Map<symbol, Koa.Middleware>()
+  private readonly upgrades = new Map<symbol, HttpUpgradeHandler>()
   private readonly router: HttpRouter
   private readonly state: {
     chain: Koa.Middleware
@@ -107,12 +115,31 @@ class Http extends Service {
     return address && typeof address !== 'string' ? address : null
   }
 
+  registerUpgrade(handle: HttpUpgradeHandler): Disposable<void | Promise<void>> {
+    if (typeof handle !== 'function') throw new TypeError('HTTP upgrade handler must be a function')
+    const id = Symbol()
+    const { state, upgrades } = this
+    return this.ctx.effect(() => {
+      upgrades.set(id, handle)
+      try {
+        state.listener?.refreshUpgrade()
+      } catch (error) {
+        upgrades.delete(id)
+        throw error
+      }
+      return () => {
+        upgrades.delete(id)
+        state.listener?.refreshUpgrade()
+      }
+    }, 'http.registerUpgrade()')
+  }
+
   async [startListener](ctx: Context, options: HttpListenerOptions): Promise<() => Promise<void>> {
     const { state } = this
     if (state.listener) throw new Error('The HTTP service already has a listener')
 
     const reportError = (error: unknown) => ctx.logger.error(error)
-    const listener = createListener(options, reportError)
+    const listener = createListener(options, reportError, this.upgrades)
     state.listener = listener
     const close = () => listener.close().finally(() => {
       if (state.listener === listener) state.listener = undefined
@@ -140,7 +167,7 @@ class Http extends Service {
 }
 
 export { Http as http }
-export type HttpService = Pick<Http, 'use' | 'route' | 'address'>
+export type HttpService = Pick<Http, 'use' | 'route' | 'address' | 'registerUpgrade'>
 
 declare module '@deepseek-ai/cordis' {
   interface Context {

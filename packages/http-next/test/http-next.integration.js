@@ -5,6 +5,8 @@ import test from 'node:test'
 import { http, httpListener } from '@ainess/http'
 import { loadHttpControllers } from '@ainess/http/controllers'
 import { httpNext } from '@ainess/http-next'
+import { websocket } from '@ainess/websocket'
+import { websocketHttp } from '@ainess/websocket/http'
 import { Context } from '@deepseek-ai/cordis'
 import { dir, dev, submitServerAction } from './fixtures/next.js'
 
@@ -14,12 +16,17 @@ test('Next and Ainess serve API, RSC, a Server Action, and assets on one port', 
   const app = new Context()
   t.after(() => app.fiber.dispose())
   await app.plugin(http).await()
+  await app.plugin(websocket).await()
+  await app.plugin(websocketHttp).await()
   await app.plugin({
-    inject: ['http'],
+    inject: ['http', 'websocket'],
     apply(ctx) {
       ctx.http.use(async (request, next) => {
         request.set('x-ainess', 'koa')
         await next()
+      })
+      ctx.websocket.route('/api/echo', {
+        onMessage: (connection, message) => connection.send(message),
       })
       return loadHttpControllers(ctx, { directory, prefix: '/-' })
     },
@@ -93,15 +100,22 @@ test('Next and Ainess serve API, RSC, a Server Action, and assets on one port', 
   const disconnected = await fetch(`${signalEndpoint}?disconnected`, { signal: AbortSignal.timeout(5_000) })
   assert.equal(disconnected.status, 204)
 
-  if (dev) {
-    const socket = new WebSocket(`${origin.replace('http:', 'ws:')}/_next/hmr?id=ainess-http-next-test`)
-    t.after(() => socket.close())
-    await once(socket, 'open', { signal: AbortSignal.timeout(10_000) })
-    const closed = once(socket, 'close', { signal: AbortSignal.timeout(10_000) })
-    await Promise.all([listener.dispose(), closed])
-  } else {
-    await listener.dispose()
+  const wsOrigin = origin.replace('http:', 'ws:')
+  const hmr = dev ? new WebSocket(`${wsOrigin}/_next/hmr?id=ainess-http-next-test`) : undefined
+  if (hmr) {
+    t.after(() => hmr.close())
+    await once(hmr, 'open', { signal: AbortSignal.timeout(10_000) })
   }
+  const socket = new WebSocket(`${wsOrigin}/api/echo`)
+  t.after(() => socket.close())
+  await once(socket, 'open', { signal: AbortSignal.timeout(10_000) })
+  const message = once(socket, 'message', { signal: AbortSignal.timeout(10_000) })
+  socket.send('WebSocket echo on a Next route')
+  assert.equal((await message)[0].data, 'WebSocket echo on a Next route')
+  const closed = once(socket, 'close', { signal: AbortSignal.timeout(10_000) })
+  const hmrClosed = hmr && once(hmr, 'close', { signal: AbortSignal.timeout(10_000) })
+  const [, [event]] = await Promise.all([listener.dispose(), closed, hmrClosed])
+  assert.equal(event.code, 1001)
   assert.equal(app.http.address(), null)
   await assert.rejects(fetch(origin), TypeError)
 })

@@ -1,5 +1,7 @@
 # @ainess/http-next
 
+业务 WebSocket 可以通过 `websocketHttp` 接入同一个 `httpListener`。已命中的业务端点优先接管 Upgrade，剩余 Upgrade 交给 Next 的原生处理器。打开 Next 页面后验证开发态 HMR 与业务连接。 [WebSocket 挂载示例](websocket.md#运行两种入口)
+
 用 `httpNext(options)` 生成 `httpListener` 的 `prepare`。宿主提供 Next.js、React 和 React DOM。前缀分流时设置 `apiPrefix`，Ainess 按完整 API 路径注册路由，其他路径直接进入 Next.js。页面需要共享 Koa 中间件时，用 `routing: 'koa-first'` 并省略 `apiPrefix`。只有路由未命中、响应尚未被接管且请求流仍可转交时才进入 Next.js。请求体解析放在匹配的 API 路由内。 [Next.js 手册](https://github.com/cevio/ainess/blob/main/packages/http-next/README.md)
 
 ## 加入 Next.js

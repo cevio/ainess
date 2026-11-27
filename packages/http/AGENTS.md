@@ -7,8 +7,9 @@
 - `@ainess/http/controllers` 的 `loadHttpControllers(ctx, { directory, prefix?, extensions? })` 由消费插件在 `apply()` 中等待。插件声明 `http` 以及各工厂需要的服务注入。默认扫描 `*.controller.js` 和 `*.controller.mjs`。模块默认导出同步工厂，接收调用方 `ctx` 并返回单个 `{ method, middlewares }` 或这些定义组成的非空数组。
 - 同一入口导出 `httpControllers({ directory, prefix?, extensions?, inject? })`，生成负责目录装配的 Cordis 插件。它自动注入 `http`，应用通过 `inject` 数组声明该批 Controller 工厂需要的其他服务。创建插件时校验注入列表。
 - 目录装配复用 `@ainess/loader` 的扫描和文件路由语法。先校验整批路径，再导入模块并检查 Controller 定义。文件目录中的 `(group)` 段从 URL 中省略。批量注册归调用方 Fiber，冲突时回滚本批，错误包含文件路径及原因。`[...name]` 只匹配非空剩余路径，并将其作为字符串放在 `request.params[name]`。更具体的通配路由没有剩余路径时，路由器继续寻找同方法的匹配。加载期间卸载插件或撤销必需服务会跳过后续模块导入、剩余工厂及本批注册。
-- `httpListener` 依赖 `http`。应用完成路由装配后再安装监听插件，并用 `Fiber.await()` 等待端口绑定。可选的 `prepare(server, handleHttp)` 在监听前运行，可返回请求处理函数、`onRouteMiss` 回退和清理函数。`ctx.http.address()` 返回实际监听地址。
+- `httpListener` 依赖 `http`。应用完成路由装配后再安装监听插件，并用 `Fiber.await()` 等待端口绑定。可选的 `prepare(server, handleHttp)` 在监听前运行，可返回请求处理函数、`onRouteMiss` 和 `onUpgrade` 回退及清理函数。`ctx.http.address()` 返回实际监听地址。
 - `onRouteMiss` 随监听 Fiber 生效。请求到达路由器且未匹配时，Koa 中间件链先完成。未接管响应且原始请求流可继续读取时，HTTP 才把原生请求和响应交给回退函数。匹配路由的响应和中间件主动设置的响应归 Koa 处理。
+- `ctx.http.registerUpgrade(handle)` 将协议处理器归属到调用方 Fiber。监听器按请求到达时的注册顺序分发原生 Upgrade，跳过已撤销的处理器。首个同步返回 `true` 的处理方接管 socket。`PreparedHttp.onUpgrade` 处理剩余 Upgrade，未认领的请求返回 `404`，处理器抛错或给出非布尔值时关闭 socket。协议可用共享监听器的 `signal` 感知排空开始。受管处理方可在监听器关闭期限内发送协议关闭帧。回退适配器连接随 HTTP 响应排空后关闭。受管分发独占 Node Server 的 `'upgrade'` 事件，适配器通过公开入口接入。
 - 监听 Fiber 管理 Node HTTP Server、连接和关闭期限。应用先等待监听 Fiber 排空并释放适配器，再卸载根 Fiber。启动失败时释放已获取的资源，保留原始错误。提供者在准备期间卸载时，监听 Fiber 回收已准备的处理函数。
 - `@ainess/http/request-signal` 提供 Node 服务端的 `getHttpRequestSignal()`。监听器为每个请求创建一个信号，连接提前关闭时触发，响应正常完成时清理监听器。相同 Node 运行环境中的适配器和已打包模块共享同一个请求异步上下文。请求上下文之外返回 `undefined`。
-- Cordis 由宿主提供。包依赖 `@ainess/loader`、Koa、koa-compose、find-my-way 和 `@standard-schema/spec` 类型。运行根目录 `pnpm test` 验证真实请求、Controller 校验与目录装配、并发请求取消隔离、注册归属、启动回滚和关闭顺序。
+- Cordis 由宿主提供。包依赖 `@ainess/loader`、Koa、koa-compose、find-my-way 和 `@standard-schema/spec` 类型。运行根目录 `pnpm test` 验证真实请求、Controller 校验与目录装配、并发请求取消隔离、注册归属、启动回滚、Upgrade 分发和关闭顺序。

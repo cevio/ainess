@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { getEventListeners } from 'node:events'
 import test from 'node:test'
 import { http, httpListener } from '@ainess/http'
 import { httpControllers } from '@ainess/http/controllers'
@@ -14,6 +15,107 @@ function gate() {
   const promise = new Promise((resolve) => { release = () => resolve(undefined) })
   return { promise, release }
 }
+
+test('a synchronous config factory is evaluated for each independent start', async (t) => {
+  let runs = 0
+  let profile = 'current'
+  const app = defineApp(() => {
+    const settings = { revision: ++runs, profile }
+    return {
+      plugins: {
+        settings: use((ctx) => { ctx.provide('settings', settings) }),
+      },
+    }
+  })
+  assert.equal(runs, 0)
+  const starts = [app.start(), app.start({ signal: new AbortController().signal })]
+  profile = 'updated'
+  const [first, second] = await Promise.all(starts)
+  t.after(() => first.stop())
+  t.after(() => second.stop())
+  assert.notEqual(first.ctx, second.ctx)
+  assert.deepEqual(first.ctx.get('settings'), { revision: 1, profile: 'current' })
+  assert.deepEqual(second.ctx.get('settings'), { revision: 2, profile: 'current' })
+})
+
+test('an asynchronous config factory prepares the plan before the HTTP entry starts', { timeout: 5_000 }, async (t) => {
+  const preparing = gate()
+  const ready = gate()
+  const controller = new AbortController()
+  let prepared = 0
+  const app = defineApp(async ({ signal }) => {
+    assert.equal(signal, controller.signal)
+    preparing.release()
+    await ready.promise
+    return {
+      plugins: { http: use(http) },
+      entries: {
+        web: use(httpListener, {
+          host: '127.0.0.1', port: 0,
+          prepare(_server, handle) {
+            prepared++
+            return { handle }
+          },
+        }),
+      },
+    }
+  })
+  const starting = app.start({ signal: controller.signal })
+  t.after(async () => {
+    ready.release()
+    await starting.then((running) => running.stop(), () => {})
+  })
+  await preparing.promise
+  assert.equal(prepared, 0)
+  ready.release()
+  const running = await starting
+  const address = running.ctx.http.address()
+  assert.ok(address)
+  assert.equal(prepared, 1)
+  const response = await fetch(`http://127.0.0.1:${address.port}/`, { signal: AbortSignal.timeout(2_000) })
+  assert.equal(response.status, 404)
+  await response.text()
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+})
+
+test('aborting config preparation stops waiting and discards a late startup plan', { timeout: 5_000 }, async () => {
+  const preparing = gate()
+  const ready = gate()
+  const controller = new AbortController()
+  const cause = new Error('configuration cancelled')
+  let evaluations = 0
+  let mounted = false
+  const app = defineApp(async () => {
+    evaluations++
+    preparing.release()
+    await ready.promise
+    return { entries: { web: use(() => { mounted = true }) } }
+  })
+
+  await assert.rejects(app.start({ signal: AbortSignal.abort(cause) }), (error) => error === cause)
+  assert.equal(evaluations, 0)
+  const starting = app.start({ signal: controller.signal })
+  const cancelled = assert.rejects(starting, (error) => error === cause)
+  try {
+    await preparing.promise
+    controller.abort(cause)
+    await cancelled
+    assert.equal(evaluations, 1)
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+  } finally {
+    ready.release()
+  }
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(mounted, false)
+})
+
+test('factory errors and invalid returned configs reject start', async () => {
+  const cause = new Error('configuration source was unavailable')
+  await assert.rejects(defineApp(() => { throw cause }).start(), (error) => error === cause)
+  await assert.rejects(defineApp(async () => { throw cause }).start(), (error) => error === cause)
+  await assert.rejects(defineApp(() => ({ startupTimeoutMs: 0 })).start(), /startupTimeoutMs/)
+  assert.throws(() => defineApp({ startupTimeoutMs: 0 }), /startupTimeoutMs/)
+})
 
 test('drains multiple entries before closing the database', { timeout: 5000 }, async (t) => {
   const workerPreparing = gate()

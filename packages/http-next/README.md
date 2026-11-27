@@ -77,13 +77,14 @@ export default defineApp({
 
 ## 开发与生产
 
-- 适配器将 Node Server 交给原生 Next.js 并等待 `next.prepare()`，随后 HTTP 插件绑定端口。Next.js 管理 App Router、RSC、Server Actions、静态资源与 HMR。准备失败时尝试关闭 Next runtime，监听关闭时由 HTTP 先排空并关闭连接，再关闭 Next runtime。
+- 适配器等待 `next.prepare()`，随后 HTTP 插件绑定端口。Next.js 管理 App Router、RSC、Server Actions、静态资源与 HMR。Next 在首次处理自己的 HTTP 请求时注册原生 Upgrade 回调，适配器通过 `PreparedHttp.onUpgrade` 转交共享监听器上未被业务协议处理器认领的连接。通过 `websocketHttp` 装配业务 WebSocket 也使用此端口。 [WebSocket 挂载](../websocket/README.md#挂载到-http)
+- 准备失败时尝试关闭 Next runtime。停止应用时由 HTTP 先排空并关闭连接，再关闭 Next runtime。
 - 开发编译器拥有进程级资源，应用以新进程完成开发态重启。使用 `ainess start` 时，进程收到退出信号后清理监听器与根 Fiber，再退出。程序入口先等待 `listener.dispose()` 和 `app.fiber.dispose()`，结束旧进程后由进程管理器启动新进程。
 - 生产前先构建实际项目。快速开始中的 `web` 目录可在应用根运行 `pnpm exec next build web`，然后用 `NODE_ENV=production pnpm exec ainess start` 启动。
 - 使用同一 Node 运行环境的 Server Component 或 Route Handler 时，可把 `getHttpRequestSignal()` 传给支持取消的调用。该入口来自 `@ainess/http/request-signal`，由共享监听器建立请求上下文。 [请求取消](../http/README.md#请求取消)
 
 ## 验证
 
-在仓库根目录运行 `pnpm test`，或 `pnpm build` 后运行 `pnpm --filter @ainess/http-next test:integration`。真实 Next 项目验证两种分流、RSC、Server Action、请求取消和 HMR 清理，也验证开发态在新进程复用同一端口。
+在仓库根目录运行 `pnpm test`，或 `pnpm build` 后运行 `pnpm --filter @ainess/http-next test:integration`。真实 Next 项目验证两种分流、RSC、Server Action、请求取消、HMR 和业务 WebSocket 的同端口收发及清理，也验证开发态在新进程复用同一端口。
 
 需要验证生产渲染时，先运行 `pnpm --filter @ainess/http-next exec next build test/fixtures/web` 构建同一夹具，再运行 `AINESS_TEST_NEXT_PRODUCTION=1 pnpm --filter @ainess/http-next test:integration`。生产模式的测试会跳过开发态重启用例。 [前缀分流测试](test/http-next.integration.js) · [Koa 优先测试](test/koa-first.integration.js) · [重启测试](test/dev-restart.integration.js)

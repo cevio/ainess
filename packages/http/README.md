@@ -48,7 +48,7 @@ try {
 | 接口或类型 | 契约 |
 | --- | --- |
 | `http` 和 `HttpOptions` | `ctx.plugin(http, options?)` 安装服务。`koa` 可传 Koa 构造选项。`router` 可设置 `caseSensitive`、`ignoreTrailingSlash`、`ignoreDuplicateSlashes` 和 `maxParamLength`，省略时沿用底层默认值。 |
-| `HttpService` | 消费插件声明 `inject: ['http']` 后，通过 `ctx.http` 使用 `use()`、`route()` 和 `address()`。 |
+| `HttpService` | 消费插件声明 `inject: ['http']` 后，通过 `ctx.http` 使用 `use()`、`route()`、`address()` 和 `registerUpgrade()`。 |
 | `HttpMethod` 和 `HttpRouteMiddleware` | 使用 find-my-way 的 HTTP 方法类型和带 `params: Record<string, string \| undefined>` 的 Koa 路由中间件类型。 |
 | `ctx.http.use(middleware)` | 注册全局 Koa 中间件，返回 `void`。用 `await next()` 进入后续中间件和路由。随调用方 Fiber 清理。 |
 | `ctx.http.route(method, path, ...middlewares)` | 路径以 `/` 开头，使用单个方法和至少一个中间件，返回可调用的撤销函数。路由随调用方 Fiber 清理，也可主动调用该函数撤销。 |
@@ -121,9 +121,17 @@ await app.plugin(httpControllers({
 | `shutdownTimeoutMs` | 默认 `30_000` 毫秒，接受 `0` 到 `2_147_483_647` 的整数。到期关闭剩余连接。 |
 | `prepare` | 可选 `HttpPrepare`，在监听前收到 Node `Server` 和原生 `handleHttp`，可同步或异步返回 `PreparedHttp`。 |
 
-`HttpHandler` 接收 Node 的 `IncomingMessage` 和 `ServerResponse`，返回 `void` 或 `Promise<void>`。`PreparedHttp` 必须提供 `handle`，可选 `onRouteMiss` 和 `dispose`。`handleHttp` 是 Ainess 的原生请求处理函数。使用 `onRouteMiss` 时由 `handleHttp` 进入 Koa，路由未匹配且 Koa 链执行完后，只有响应未被接管、请求流仍可用的请求才交给回退。需要托管 Next.js 时直接使用 [`httpNext()`](../http-next/README.md)。
+`HttpHandler` 接收 Node 的 `IncomingMessage` 和 `ServerResponse`，返回 `void` 或 `Promise<void>`。`PreparedHttp` 必须提供 `handle`，可选 `onRouteMiss`、`onUpgrade` 和 `dispose`。`handleHttp` 是 Ainess 的原生请求处理函数。使用 `onRouteMiss` 时由 `handleHttp` 进入 Koa，路由未匹配且 Koa 链执行完后，只有响应未被接管、请求流仍可用的请求才交给回退。需要托管 Next.js 时直接使用 `httpNext()`。 [Next.js 适配器](../http-next/README.md)
 
-关闭时监听器停止接收新连接，排空在途响应，关闭剩余连接后执行 `dispose`。进入排空后到达监听回调的请求返回 `503`。监听器负责关闭连接，应用负责先等监听器清理，再释放路由和底层服务。程序使用 `listener.dispose()`，由 framework 装配的应用使用 `running.stop()`。
+关闭时监听器停止接收新连接，通知协议处理方并排空在途响应，关闭剩余连接后执行 `dispose`。进入排空后到达监听回调的请求返回 `503`。监听器负责关闭连接，应用负责先等监听器清理，再释放路由和底层服务。程序使用 `listener.dispose()`，由 framework 装配的应用使用 `running.stop()`。
+
+### 协议升级
+
+`ctx.http.registerUpgrade(handle: HttpUpgradeHandler)` 注册协议处理器并返回撤销函数，注册归调用方 Fiber。`HttpUpgradeHandler` 接收 `HttpUpgrade`，含原生 `request`、`socket`、`head` 和 `signal`。处理器同步返回 `true` 认领连接，随后可异步完成协议握手。返回 `false` 时保留 socket 和数据给下一处理方。抛错或返回 Promise 等非布尔值时，监听器记录错误并销毁 socket。
+
+分发按该次 Upgrade 到达时的注册顺序执行。分发中新注册的处理器从下一次 Upgrade 生效，已撤销的处理器会跳过。最后调用可选的 `PreparedHttp.onUpgrade`，其签名与注册处理器相同。启用分发时，未认领的 Upgrade 返回 `404`。适配器通过这些公开入口加入同一个 `httpListener` 的 Upgrade 分发器。受管分发独占 Node Server 的 `'upgrade'` 事件。原生监听器和受管分发的注册发生冲突时，后加入的一方会收到错误。
+
+`signal` 在监听器开始排空时中止。注册处理器接管的连接可在 `shutdownTimeoutMs` 内完成关闭握手。`PreparedHttp.onUpgrade` 接管的连接随普通 HTTP 响应排空后关闭。需要提供业务 WebSocket 时使用 `websocketHttp`。 [WebSocket 挂载示例](../websocket/README.md#挂载到-http)
 
 ## 请求取消
 
@@ -131,4 +139,4 @@ await app.plugin(httpControllers({
 
 ## 验证
 
-在仓库根目录运行 `pnpm test`，或 `pnpm build` 后运行 `node --test packages/http/test/*.test.js`。测试发出真实 HTTP 请求，验证路由、一次性校验、目录冲突回滚、并发请求取消隔离和关闭期限。 [HTTP 测试](test/http.test.js) · [Controller 测试](test/controllers.test.js) · [取消测试](test/request-signal.test.js)
+在仓库根目录运行 `pnpm test`，或 `pnpm build` 后运行 `node --test packages/http/test/*.test.js`。测试发出真实 HTTP 请求和协议升级，验证路由、一次性校验、目录冲突回滚、并发请求取消隔离和关闭期限。 [HTTP 测试](test/http.test.js) · [Controller 测试](test/controllers.test.js) · [取消测试](test/request-signal.test.js) · [Upgrade 测试](test/upgrade.test.js)

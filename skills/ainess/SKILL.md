@@ -1,6 +1,6 @@
 ---
 name: ainess
-description: 按包选择、接入和验证 Ainess。用于装配 Cordis 应用、通过 CLI 启停、接入 HTTP、Next.js、Model、TypeORM、Redis、TCP RPC、Registry 服务发现和 Micro，以及复用目录加载能力。
+description: 按包选择、接入和验证 Ainess。用于装配 Cordis 应用、通过 CLI 启停、接入 HTTP、Next.js、WebSocket 服务端与重连客户端、Model、TypeORM、Redis、TCP RPC、Registry 服务发现和 Micro，以及复用目录加载能力。
 ---
 
 # 使用 Ainess
@@ -15,6 +15,9 @@ description: 按包选择、接入和验证 Ainess。用于装配 Cordis 应用�
 | [@ainess/cli](references/cli.md) | 用 `ainess start` 读取 ESM 配置，处理进程信号和退出。 |
 | [@ainess/http](references/http.md) | 装配 Koa 中间件、Controller、HTTP 监听器和请求取消。 |
 | [@ainess/http-next](references/http-next.md) | 在同一 HTTP 监听器上提供 Ainess API 和 Next.js。 |
+| [@ainess/websocket](references/websocket.md) | 按目录装配名为 `.ws` 的端点，在独立或共享端口提供方法、事件和流。 |
+| [@ainess/websocket-client](references/websocket-client.md) | 从浏览器或 Node.js 调用 WebSocket 方法、接收流、收发事件和自动重连。 |
+| [@ainess/websocket-shared](references/websocket-shared.md) | 使用两端共用的 WebSocket 模式、消息和流类型。 |
 | [@ainess/model](references/model.md) | 定义和注入领域方法，按目录装配，生成类型与运行清单。 |
 | [@ainess/typeorm](references/typeorm.md) | 通过 Cordis 提供原生 TypeORM 数据源，复用仓储和事务。 |
 | [@ainess/ioredis](references/ioredis.md) | 通过 Cordis 复用 Redis 单节点、Sentinel 或 Cluster 客户端，并提供租约锁、限流和幂等。 |
@@ -29,6 +32,7 @@ description: 按包选择、接入和验证 Ainess。用于装配 Cordis 应用�
 
 - 框架先激活 `plugins`，再启动 `entries`。把数据库、Model 和路由放在前一组，把监听器放在后一组。进程入口可用 CLI 启停。 [应用装配](references/framework.md) · [启动命令](references/cli.md)
 - Controller 在请求边界校验输入，Model 方法通过自己的 `inject` 取得 TypeORM 等依赖。需要在同一端口服务页面时，再为 `httpListener` 装配 Next.js。 [HTTP、Model 和 TypeORM](references/http.md#运行-httpmodel-和-typeorm) · [Next.js](references/http-next.md)
+- 用 `.ws` 文件装配 WebSocket 方法、事件和流。独立服务安装 `websocketListener`，共用端口时在 HTTP 应用中安装 `websocketHttp`。客户端使用 `connectWebSocketEndpoint()` 调用这些端点。 [WebSocket 端到端](references/websocket.md#按文件装配命名端点) · [重连客户端](references/websocket-client.md)
 - 业务入口可从 `*.rpc.js` 或 `*.rpc.mjs` 加载 RPC 方法，再启动监听并向 Registry 登记。需要自行管理业务连接时，选址后用 RPC 直连。需要按服务名调用时，将发现对象注入 Micro。 [注册与直连](references/registry-client.md) · [目录加载与 Micro 调用](references/micro.md#通过-micro-调用已登记服务)
 - 独立 Cordis 宿主先停止入口并等待清理，再卸载根 Fiber。使用 framework 时等待 `running.stop()`。连接、定时器等外部资源由创建它们的插件通过 `ctx.effect()` 管理。
 

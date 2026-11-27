@@ -269,6 +269,9 @@ importers:
         specifier: workspace:^
         version: link:../http
     devDependencies:
+      '@ainess/websocket':
+        specifier: workspace:^
+        version: link:../websocket
       '@deepseek-ai/cordis':
         specifier: 'catalog:'
         version: 4.1.0
@@ -414,6 +417,42 @@ importers:
       typeorm:
         specifier: 1.1.3
         version: 1.1.3(ioredis@5.11.1)(sql.js@1.17.0)
+
+  packages/websocket:
+    dependencies:
+      '@ainess/loader':
+        specifier: workspace:^
+        version: link:../loader
+      '@ainess/websocket-shared':
+        specifier: workspace:^
+        version: link:../websocket-shared
+      '@standard-schema/spec':
+        specifier: 1.1.0
+        version: 1.1.0
+      ws:
+        specifier: 8.23.0
+        version: 8.23.0
+    devDependencies:
+      '@ainess/http':
+        specifier: workspace:^
+        version: link:../http
+      '@ainess/websocket-client':
+        specifier: workspace:^
+        version: link:../websocket-client
+      '@deepseek-ai/cordis':
+        specifier: 'catalog:'
+        version: 4.1.0
+      '@types/ws':
+        specifier: 8.18.2
+        version: 8.18.2
+
+  packages/websocket-client:
+    dependencies:
+      '@ainess/websocket-shared':
+        specifier: workspace:^
+        version: link:../websocket-shared
+
+  packages/websocket-shared: {}
 
 packages:
 
@@ -731,6 +770,9 @@ packages:
 
   '@types/serve-static@2.2.0':
     resolution: {integrity: sha512-8mam4H1NHLtu7nmtalF7eyBH14QyOASmcxHhSfEoRyr0nP/YdoesEtU+uSRvMe96TW/HPTtkoKqQLl53N7UXMQ==}
+
+  '@types/ws@8.18.2':
+    resolution: {integrity: sha512-67MQl+fpWKVTT1NYdnmo3U4sc/xPo/zQBncVnI74qmQa0z/b+1g6iYqNmGCPbxO+zz2aklb08a0oHfegiVd0/w==}
 
   '@typescript/typescript-aix-ppc64@7.0.2':
     resolution: {integrity: sha512-MTKKkWB7p/0E9xi1d1tHtZ5PiLkGEMIq88pK2CubZjOsLtYTLqhgIgi6zepFa+9GHZ6h05NMCkQxGKiPXMxXtQ==}
@@ -1374,6 +1416,18 @@ packages:
     resolution: {integrity: sha512-42AtmgqjV+X1VpdOfyTGOYRi0/zsoLqtXQckTmqTeybT+BDIbM/Guxo7x3pE2vtpr1ok6xRqM9OpBe+Jyoqyww==}
     engines: {node: '>=18'}
 
+  ws@8.23.0:
+    resolution: {integrity: sha512-wCkmX8QMOrKjgO8HW2WyDbTSGeqkocxgDzS9iR79rEAexty6/2qzilx3Ag8Tqf9ykop3irLKle0MtVn5qjVnoQ==}
+    engines: {node: '>=10.0.0'}
+    peerDependencies:
+      bufferutil: ^4.0.1
+      utf-8-validate: '>=5.0.2'
+    peerDependenciesMeta:
+      bufferutil:
+        optional: true
+      utf-8-validate:
+        optional: true
+
   y18n@5.0.8:
     resolution: {integrity: sha512-0pfFzegeDWJHJIAmTLRP2DwHjdF5s7jo9tuztdQxAhINCdvS+3nGINqPd00AphqJR/0LhANUS6/+7SCb98YOfA==}
     engines: {node: '>=10'}
@@ -1629,6 +1683,10 @@ snapshots:
   '@types/serve-static@2.2.0':
     dependencies:
       '@types/http-errors': 2.0.5
+      '@types/node': 26.6.6
+
+  '@types/ws@8.18.2':
+    dependencies:
       '@types/node': 26.6.6
 
   '@typescript/typescript-aix-ppc64@7.0.2':
@@ -2122,6 +2180,8 @@ snapshots:
       ansi-styles: 6.2.3
       string-width: 7.2.0
       strip-ansi: 7.2.0
+
+  ws@8.23.0: {}
 
   y18n@5.0.8: {}
 

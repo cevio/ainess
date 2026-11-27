@@ -1,4 +1,5 @@
-import type { HttpPrepare } from '@ainess/http'
+import { createServer } from 'node:http'
+import type { HttpPrepare, HttpUpgradeHandler } from '@ainess/http'
 import nextModule from 'next'
 
 // Next's public CommonJS entry is callable. Its declarations re-export a default.
@@ -32,13 +33,18 @@ export function httpNext(options: HttpNextOptions | HttpNextKoaFirstOptions): Ht
     throw new TypeError('apiPrefix can only be used with prefix routing')
   }
 
-  return async (server, handleHttp) => {
-    const app = next({ dir, dev, httpServer: server })
+  return async (_server, handleHttp) => {
+    // Next registers its own upgrade listener on the supplied server on the first Next request.
+    const upgrades = createServer()
+    const app = next({ dir, dev, httpServer: upgrades })
     try {
       await app.prepare()
       const handleNext = app.getRequestHandler()
+      const onUpgrade: HttpUpgradeHandler = ({ request, socket, head }) => {
+        return upgrades.emit('upgrade', request, socket, head)
+      }
       const dispose = () => app.close()
-      if (routing === 'koa-first') return { handle: handleHttp, onRouteMiss: handleNext, dispose }
+      if (routing === 'koa-first') return { handle: handleHttp, onRouteMiss: handleNext, onUpgrade, dispose }
 
       const apiPath = `${apiPrefix}/`
       return {
@@ -47,6 +53,7 @@ export function httpNext(options: HttpNextOptions | HttpNextKoaFirstOptions): Ht
           if (path === apiPrefix || path?.startsWith(apiPath)) return handleHttp(request, response)
           return handleNext(request, response)
         },
+        onUpgrade,
         dispose,
       }
     } catch (error) {
