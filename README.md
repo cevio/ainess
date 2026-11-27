@@ -12,7 +12,7 @@ Ainess 是一个基于 `@deepseek-ai/cordis` 的 TypeScript ESM monorepo。Cordi
 | [@ainess/http-next](packages/http-next/README.md) | 通过同一监听器提供 Ainess API 和 Next.js 页面。 |
 | [@ainess/model](packages/model/README.md) | 定义、加载和调用类型化领域方法，生成声明和构建清单。 |
 | [@ainess/typeorm](packages/typeorm/README.md) | 注入原生 TypeORM 数据源。 |
-| [@ainess/ioredis](packages/ioredis/README.md) | 注入原生 Redis 单节点、Sentinel 或 Cluster 客户端。 |
+| [@ainess/ioredis](packages/ioredis/README.md) | 注入原生 Redis 单节点、Sentinel 或 Cluster 客户端，并复用连接执行租约锁、限流和幂等操作。 |
 | [@ainess/loader](packages/loader/README.md) | 在消费包中复用模块扫描、导入与文件路由解析。 |
 | [@ainess/rpc](packages/rpc/README.md) | 在同一 TCP 长连接两端发起和处理单响应或流式 RPC，支持运行时注册、注销和调用结果观察。[单连接性能实测](packages/rpc/README.md#单连接性能实测) |
 | [@ainess/micro](packages/micro/README.md) | 按目录装配 RPC 方法，按服务名调用远程 RPC，并管理连接复用和实例熔断。 |

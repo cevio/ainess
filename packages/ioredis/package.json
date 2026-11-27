@@ -8,13 +8,28 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./lock": {
+      "types": "./dist/lock.d.ts",
+      "default": "./dist/lock.js"
+    },
+    "./rate-limit": {
+      "types": "./dist/rate-limit.d.ts",
+      "default": "./dist/rate-limit.js"
+    },
+    "./idempotency": {
+      "types": "./dist/idempotency.d.ts",
+      "default": "./dist/idempotency.js"
     }
   },
   "scripts": {
     "build": "tsc"
   },
   "dependencies": {
-    "@types/redis-errors": "1.2.3"
+    "@types/redis-errors": "1.2.3",
+    "quayside": "1.4.0",
+    "redlimit": "2.1.0",
+    "redlock-universal": "0.8.10"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "catalog:",

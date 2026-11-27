@@ -12,6 +12,7 @@ import { promisify } from 'node:util'
 import { ioredis } from '@ainess/ioredis'
 import { Context } from '@deepseek-ai/cordis'
 import { Cluster, Redis } from 'ioredis'
+import { testRedisPrimitives, testRedisStringNumbers } from './primitives.js'
 
 const hasRedisTools = ['redis-server', 'redis-cli'].every((command) =>
   spawnSync(command, ['--version'], { stdio: 'ignore' }).status === 0,
@@ -127,7 +128,7 @@ test('the cluster provider routes across masters and closes after consumer clean
 
   const provider = await app.plugin(ioredis, {
     startupNodes: [{ host: '127.0.0.1', port: ports[0] }],
-    clusterOptions: { redisOptions: { commandTimeout: 1_000 } },
+    clusterOptions: { keyPrefix: 'fixture:', scaleReads: 'all', redisOptions: { commandTimeout: 1_000 } },
   }).await()
   await consumer.await()
   const client = app.get('ioredis')
@@ -137,6 +138,54 @@ test('the cluster provider routes across masters and closes after consumer clean
   assert.equal(masters.length, 3)
   const sizes = await Promise.all(masters.map((node) => node.dbsize()))
   assert.ok(sizes.filter((size) => size > 0).length >= 2)
+
+  await testRedisPrimitives(t, client)
+  await t.test('native stringNumbers on cluster node connections', async (subtest) => {
+    const numbers = client.duplicate(undefined, {
+      lazyConnect: true, redisOptions: { ...client.options.redisOptions, stringNumbers: true },
+    })
+    subtest.after(() => numbers.disconnect())
+    await numbers.connect()
+    await testRedisStringNumbers(subtest, numbers)
+  })
+  await t.test('idempotency reads the primary even if a queued read would be routed again', async (subtest) => {
+    const { createRedisIdempotency } = await import('@ainess/ioredis/idempotency')
+    const originalScaleReads = client.options.scaleReads
+    try {
+      client.options.scaleReads = 'master'
+      const idempotency = createRedisIdempotency(client)
+      await idempotency.execute('switch-read-routing', () => 'receipt')
+
+      let routedReads = 0
+      const selectReadNode = (/** @type {Redis[]} */ nodes) => {
+        routedReads++
+        return nodes[0]
+      }
+      client.options.scaleReads = selectReadNode
+      assert.equal(await client.get(keys[0]), keys[0])
+      assert.equal(routedReads, 1)
+      assert.equal(await idempotency.execute('switch-read-routing', () => assert.fail('expected replay')), 'receipt')
+      assert.equal(routedReads, 1)
+
+      client.options.scaleReads = 'master'
+      const dispatchGet = client.get.bind(client)
+      subtest.mock.method(client, 'get', (/** @type {string} */ key) => {
+        // ioredis re-enters sendCommand and reads the current routing option when flushing queued commands.
+        client.options.scaleReads = selectReadNode
+        return dispatchGet(key)
+      })
+      assert.equal(await idempotency.execute('switch-read-routing', () => assert.fail('expected replay')), 'receipt')
+      assert.equal(routedReads, 1)
+    } finally {
+      client.options.scaleReads = originalScaleReads
+    }
+  })
+  const storedKeys = (await Promise.all(masters.map((node) => node.keys('*')))).flat()
+  for (const feature of ['lock', 'rate-limit', 'idempotency']) {
+    const keys = storedKeys.filter((key) => key.includes(`${feature}:`))
+    assert.ok(keys.length > 0)
+    assert.ok(keys.every((key) => key.startsWith(`fixture:${feature}:`)), keys.join(', '))
+  }
 
   const sockets = masters.map((node) => node.stream).filter(Boolean)
   await provider.dispose()

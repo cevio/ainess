@@ -10,9 +10,45 @@ import test from 'node:test'
 import { ioredis } from '@ainess/ioredis'
 import { Context } from '@deepseek-ai/cordis'
 import { Redis } from 'ioredis'
+import { testRedisPrimitives, testRedisStringNumbers } from './primitives.js'
 
 const hasRedisServer = process.platform !== 'win32'
   && spawnSync('redis-server', ['--version'], { stdio: 'ignore' }).status === 0
+
+test('a short lease uses a positive minimum TTL for automatic renewal', async (t) => {
+  const { createRedisLock } = await import('@ainess/ioredis/lock')
+  const client = new Redis({ lazyConnect: true })
+  t.after(() => client.disconnect())
+  t.mock.method(performance, 'now', () => 1_000)
+  t.mock.method(client, 'eval', async () => 'OK')
+  let announceRenewal = () => {}
+  const renewal = new Promise((resolve) => { announceRenewal = () => resolve(undefined) })
+  let minimumTtl
+  /**
+   * @param {string} _digest
+   * @param {number} _keyCount
+   * @param {...(string | number | Buffer)} args
+   */
+  const scriptReply = async (_digest, _keyCount, ...args) => {
+    if (args.length === 4) {
+      minimumTtl = args[2]
+      announceRenewal()
+      return [1, 5]
+    }
+    assert.equal(args.length, 2)
+    return 1
+  }
+  t.mock.method(client, 'evalsha', scriptReply)
+
+  const lock = createRedisLock(client, 'short-lease', { ttlMs: 9 })
+  const result = await lock.withLock(async ({ signal }) => {
+    await Promise.race([renewal, once(signal, 'abort', { signal: AbortSignal.timeout(250) })])
+    assert.equal(signal.aborted, false)
+    return 'held'
+  })
+  assert.equal(result, 'held')
+  assert.equal(minimumTtl, '1')
+})
 
 test('Redis is ready before injection, can reconnect, and closes after consumer cleanup', {
   skip: !hasRedisServer && 'redis-server with Unix socket support is unavailable',
@@ -83,6 +119,14 @@ test('Redis is ready before injection, can reconnect, and closes after consumer 
   await reconnected
   assert.equal(retries, 1)
   assert.equal(await client.get('message'), 'through Cordis')
+
+  await testRedisPrimitives(t, client)
+  await t.test('native stringNumbers on a standalone client', async (subtest) => {
+    const numbers = client.duplicate({ lazyConnect: true, stringNumbers: true })
+    subtest.after(() => numbers.disconnect())
+    await numbers.connect()
+    await testRedisStringNumbers(subtest, numbers)
+  })
 
   await provider.dispose()
   assert.equal(valueAtDisposal, 'through Cordis')

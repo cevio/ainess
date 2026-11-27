@@ -17,7 +17,7 @@ description: 按包选择、接入和验证 Ainess。用于装配 Cordis 应用�
 | [@ainess/http-next](references/http-next.md) | 在同一 HTTP 监听器上提供 Ainess API 和 Next.js。 |
 | [@ainess/model](references/model.md) | 定义和注入领域方法，按目录装配，生成类型与运行清单。 |
 | [@ainess/typeorm](references/typeorm.md) | 通过 Cordis 提供原生 TypeORM 数据源，复用仓储和事务。 |
-| [@ainess/ioredis](references/ioredis.md) | 通过 Cordis 复用 Redis 单节点、Sentinel 或 Cluster 客户端。 |
+| [@ainess/ioredis](references/ioredis.md) | 通过 Cordis 复用 Redis 单节点、Sentinel 或 Cluster 客户端，并提供租约锁、限流和幂等。 |
 | [@ainess/loader](references/loader.md) | 为目录插件复用文件扫描、默认导出解码和文件路由。 |
 | [@ainess/rpc](references/rpc.md) | 在已知地址上建立可双向调用的 TCP 连接，发送单响应或流式 RPC。 |
 | [@ainess/registry-server](references/registry-server.md) | 监听注册中心端口，按连接管理服务登记并提供轮询选址。 |
