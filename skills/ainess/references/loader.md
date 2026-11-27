@@ -28,4 +28,4 @@ const views = await importModules(files, (value) => {
 console.log(routes, views.map(({ value }) => value))
 ```
 
-`scanModules()` 默认匹配 `.js` 和 `.mjs`，可按需传入 `extensions`。它先给出按相对路径排序的记录，便于导入前统一发现路径错误。`importModules()` 依次执行模块并把默认导出交给解码器。信号中止后等当前步骤结束，跳过后续导入。消费插件管理业务注册、冲突回滚和卸载。无需预处理时可直接用 `loadModules(options, decode)`。 [Controller 目录](http.md) · [Model 目录](model.md#按目录装配并调用)
+`scanModules()` 默认匹配 `.js` 和 `.mjs`，可按需传入 `extensions`。它先给出按相对路径排序的记录，便于导入前统一发现路径错误。`importModules()` 依次执行模块并把默认导出交给解码器。信号中止后等当前步骤结束，跳过后续导入。消费插件管理业务注册、冲突回滚和卸载。无需预处理时可直接用 `loadModules(options, decode)`。 [HTTP Controller](http.md) · [Model 目录](model.md#按目录装配并调用) · [Micro Controller](micro.md#通过-micro-调用已登记服务)

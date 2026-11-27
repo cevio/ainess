@@ -1,6 +1,6 @@
 # @ainess/loader
 
-为按目录装配的功能提供模块扫描、默认导出解码和文件路由解析。它使用 Node.js 文件及 ESM API，包内依赖 `glob`。需要装配 HTTP Controller 或 Model 时，优先使用对应包的目录入口，由该包管理业务定义、注册和清理。 [HTTP Controller](../http/README.md#按目录装配-controller) · [Model 目录](../model/README.md#按目录装配)
+为按目录装配的功能提供模块扫描、默认导出解码和文件路由解析。它使用 Node.js 文件及 ESM API，包内依赖 `glob`。需要装配 HTTP Controller、Model 或 RPC 方法时，优先使用对应包的目录入口，并按其契约注册和清理。 [HTTP Controller](../http/README.md#按目录装配-controller) · [Model 目录](../model/README.md#按目录装配) · [Micro Controller](../micro/README.md#按目录装配-rpc-方法)
 
 ## 快速开始
 

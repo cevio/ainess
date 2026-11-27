@@ -3,7 +3,9 @@ import { createMicroClient } from './client.js'
 import type { MicroClient, MicroOptions } from './client.js'
 
 export { createMicroClient }
-export type { MicroCircuitBreakerOptions, MicroClient, MicroDiscovery, MicroOptions } from './client.js'
+export type {
+  MicroCircuitBreakerOptions, MicroClient, MicroDiscovery, MicroOptions, MicroStreamOptions, MicroTimingEvent,
+} from './client.js'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {

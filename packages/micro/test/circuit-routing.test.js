@@ -463,6 +463,9 @@ for (const expiry of ['during', 'after']) test(`an expired address can rejoin wh
   /** @type {(readonly import('@ainess/rpc').RpcAddress[])[]} */
   const lookups = []
   const client = createMicroClient({
+    // Leave time for the call, shared selection, and discovery when advancing through the cooldown.
+    timeoutMs: 10_000,
+    connectTimeoutMs: 10_000,
     discovery: {
       async pick({ exclude = [] }) {
         lookups.push(exclude)

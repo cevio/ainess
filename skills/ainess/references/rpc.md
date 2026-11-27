@@ -1,10 +1,14 @@
 # @ainess/rpc
 
-用 `RpcServer.listen({ host, port, onPeer, signal })` 开始监听。可选的 `signal` 用于取消监听启动。`RpcPeer.connect({ host, port }, { methods, signal })` 先拨通 TCP，再用同一个 socket 初始化 RPC 并完成握手。两阶段共用 10 秒时限，可通过 `signal` 取消。连接两端都可发起和处理调用。监听端在 `onPeer` 取得接入端点，处理函数通过上下文的 `peer` 发起同连接反向调用。用 `peer.register()` 注册连接专属方法，用 `server.register()` 注册监听器共享方法。连接专属方法优先于同名共享方法。返回的注销函数立即移除该注册，并等待它已接收的调用清理。任一端可用 `request(name, options?)` 接收单响应，用 `stream(name, options?)` 接收流。发送初始数据时，在方法名和选项之间传入 `Uint8Array`。提供 `options.input` 开启上传流，上传源应响应自己的 `AbortSignal`。处理方可通过 `input.stop()` 只停止上传方向。业务对象由应用编解码，结束时等待端点和监听器的 `close()`。 [RPC 手册](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md)
+用 `RpcServer.listen({ host, port, onPeer, signal })` 开始监听。可选的 `signal` 用于取消监听启动。`RpcPeer.connect({ host, port }, { methods, signal })` 先拨通 TCP，再用同一个 socket 初始化 RPC 并完成 `HELLO` 握手。两阶段共用从拨号开始计的 10 秒时限，到期关闭 socket 并以 `UNAVAILABLE` 拒绝。可通过 `signal` 取消。连接两端都可发起和处理调用。监听端在 `onPeer` 取得接入端点，处理函数通过上下文的 `peer` 发起同连接反向调用。用 `peer.register()` 注册连接专属方法，用 `server.register()` 注册监听器共享方法。连接专属方法优先于同名共享方法。返回的注销函数立即移除该注册，并等待它已接收的调用清理。任一端可用 `request(name, options?)` 接收单响应，用 `stream(name, options?)` 接收流。发送初始数据时，在方法名和选项之间传入 `Uint8Array`。提供 `options.input` 开启上传流，上传源应响应自己的 `AbortSignal`。处理方可通过 `input.stop()` 只停止上传方向。业务对象由应用编解码，结束时等待端点和监听器的 `close()`。 [RPC 手册](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md)
 
 连接双方通过 16 字节 `HELLO` 交换帧大小与接收窗口，后续通过字节窗口和 TCP 背压调度传输。两端启用 TCP KeepAlive，初始空闲阈值默认为 30 秒。监听端和拨号端都可用 `keepAliveInitialDelayMs` 设置本端的阈值，实际探测受平台限制。对任一端点使用 `peer.onClose(listener)` 订阅一次异步关闭通知，已关闭的端点也会通知新订阅。监听器接收 `RpcCloseInfo` 的 `reason` 和 `error`，返回的取消订阅函数由调用方管理。应用可在通知时从连接表移除端点，并自行安排重连。 [传输协议](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#传输协议) · [连接保活和关闭通知](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#连接保活和关闭通知)
 
 调用选项 `onResponse` 可观察首个成功响应，`onFailure` 可观察已开始调用的失败来源、本端 `OPEN` 提交时间和流式响应是否已开始。由调用信号取消时，RPC 错误的 `cause` 保留信号原因。调用方通过 Promise 或迭代器接收调用结果。 [RPC 调用选项](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#发起调用)
+
+已有调用时限的上层可以通过 `openDeadline: { at, cause? }` 传入基于本进程 `performance.now()` 的绝对发送时限。RPC 在提交 `OPEN` 前检查此时限和 `timeoutMs`，过期帧直接丢弃。等待队列期间用 `timeoutMs` 或 `signal` 管理主动取消。 [RPC 调用选项](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#发起调用)
+
+用 `beforeResponse` 在接纳每个有效的 `DATA` 或成功 `END` 前同步检查响应时限。抛出的 `RpcError` 作为本端调用失败报告，其他异常以带 `cause` 的 `INTERNAL` 报告。对端 `ERROR` 帧沿用远端错误处理。 [RPC 调用选项](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#发起调用)
 
 按大小分批编码时使用 `rpcPayloadLimit(method?)` 取得当前协议的载荷上限。传方法名计算初始请求的可用字节数，省略时计算单个流元素或单响应的上限。 [RPC 接口](https://github.com/cevio/ainess/blob/main/packages/rpc/README.md#接口)
 

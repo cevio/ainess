@@ -4,7 +4,7 @@ import { observeAbort } from './abort.js'
 import { deferred } from './deferred.js'
 import { IncomingCalls } from './incoming.js'
 import { MethodRegistry } from './methods.js'
-import { HANDSHAKE_TIMEOUT_MS, MessageModem, resolveKeepAliveInitialDelay } from './modem.js'
+import { HANDSHAKE_TIMEOUT_MS, handshakeTimedOut, MessageModem, resolveKeepAliveInitialDelay } from './modem.js'
 import { OutgoingCalls } from './outgoing.js'
 import { RpcError } from './types.js'
 import type { Bytes, RpcAddress, RpcCallOptions, RpcCloseInfo, RpcCloseReason, RpcMethod } from './types.js'
@@ -32,6 +32,7 @@ export class RpcPeer {
     role: 'dialer' | 'acceptor',
     private readonly methods: MethodRegistry,
     keepAliveInitialDelayMs: number,
+    helloDeadline?: number,
     sharedMethods?: MethodRegistry,
     onPeer?: (peer: RpcPeer) => void,
     onClose?: () => void,
@@ -46,7 +47,7 @@ export class RpcPeer {
       this.#outgoing.closed(error)
       this.#incoming.closed(error)
       onClose?.()
-    }, onPeer && (() => this.#notify(onPeer)), keepAliveInitialDelayMs)
+    }, onPeer && (() => this.#notify(onPeer)), keepAliveInitialDelayMs, helloDeadline)
     this.#incoming = new IncomingCalls(this.#modem, this, methods, sharedMethods)
     this.#outgoing = new OutgoingCalls(this.#modem)
   }
@@ -60,6 +61,7 @@ export class RpcPeer {
 
     const socketOptions = { host: address.host, port: address.port, highWaterMark: LIMITS.callWindow }
     if (signal?.aborted) throw cancelled()
+    const helloDeadline = performance.now() + HANDSHAKE_TIMEOUT_MS
     const socket = createConnection(socketOptions)
     const connected = deferred<void>()
     const closed = deferred<void>()
@@ -94,7 +96,7 @@ export class RpcPeer {
     socket.on('error', onError)
     socket.once('close', onClose)
     const deadline = setTimeout(
-      () => stop(new RpcError('UNAVAILABLE', 'RPC handshake timed out')),
+      () => stop(handshakeTimedOut()),
       HANDSHAKE_TIMEOUT_MS,
     ).unref()
 
@@ -104,7 +106,8 @@ export class RpcPeer {
       if (dialError) throw dialError
       if (signal?.aborted) throw cancelled()
       if (socket.destroyed) throw disconnected()
-      peer = new RpcPeer(socket, 'dialer', methods ?? new MethodRegistry(), keepAliveInitialDelayMs)
+      if (performance.now() >= helloDeadline) throw handshakeTimedOut()
+      peer = new RpcPeer(socket, 'dialer', methods ?? new MethodRegistry(), keepAliveInitialDelayMs, helloDeadline)
       detach()
       await peer.#modem.ready
       if (signal?.aborted) throw cancelled()
@@ -133,7 +136,7 @@ export class RpcPeer {
     onClose: () => void,
   ): RpcPeer {
     return new RpcPeer(socket, 'acceptor', new MethodRegistry(), keepAliveInitialDelayMs,
-      sharedMethods, onPeer, onClose)
+      undefined, sharedMethods, onPeer, onClose)
   }
 
   get remainingOutgoingCallIds(): number {

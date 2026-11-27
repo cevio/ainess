@@ -61,7 +61,7 @@ try {
 | `RpcServer.listen({ host, port, methods?, onPeer?, keepAliveInitialDelayMs?, signal? })` | 开始监听，返回 `Promise<RpcServer>`。可用端口 `0` 分配空闲端口，再从 `server.address` 读取地址。可通过 `methods` 在监听前预注册共享方法。`keepAliveInitialDelayMs` 应用于每条接入连接。`signal` 可取消启动并以 `CANCELLED` 拒绝。成功返回后的监听由 `server.close()` 关闭。 |
 | `onPeer(peer)` | 监听端在协议握手完成后同步调用，早于该连接首个入站调用的分派。首个调用所需的方法应在回调的同步部分注册。回调异常会关闭该连接。 |
 | `server.register({ name, mode, handle })` | 注册监听器共享方法，已有接入连接的后续调用也能使用。返回注销函数 `() => Promise<void>`。 |
-| `RpcPeer.connect({ host, port }, { signal?, methods?, keepAliveInitialDelayMs? }?)` | 先拨通 TCP，再在同一个 socket 上初始化 RPC 并完成 `HELLO` 握手，返回 `Promise<RpcPeer>`。TCP 拨号和 RPC 握手共用 10 秒时限，可用 `signal` 取消任一阶段。`methods` 在发送 `HELLO` 前注册，接入端可在 `onPeer` 中立即调用。`keepAliveInitialDelayMs` 配置拨号端的首次探测。 |
+| `RpcPeer.connect({ host, port }, { signal?, methods?, keepAliveInitialDelayMs? }?)` | 先拨通 TCP，再在同一个 socket 上初始化 RPC 并完成 `HELLO` 握手，返回 `Promise<RpcPeer>`。两阶段共用从拨号开始计的 10 秒时限，到期关闭 socket 并以 `UNAVAILABLE` 拒绝。可用 `signal` 取消任一阶段。`methods` 在发送 `HELLO` 前注册，接入端可在 `onPeer` 中立即调用。`keepAliveInitialDelayMs` 配置拨号端的首次探测。 |
 | `peer.remainingOutgoingCallIds` | 只读 `number`，表示此端点尚可分配的调用 ID 数量。ID 耗尽或连接开始关闭后为 `0`。 |
 | `rpcPayloadLimit(method?)` | 返回单帧可用的载荷字节数。传方法名时返回扣除 UTF-8 方法名及长度字段后的初始请求上限。省略方法名时返回单个流元素或单响应的上限。方法名无效时抛出 `INVALID_ARGUMENT`。 |
 | `peer.register({ name, mode, handle })` | 注册该端点的连接专属方法，返回注销函数 `() => Promise<void>`。 |
@@ -99,9 +99,13 @@ try {
 
 `options.signal` 中止整个调用，以 `CANCELLED` 报告并在错误的 `cause` 保留信号原因。`options.timeoutMs` 接受 1 至 2,147,483,647 的整数，省略时不限时。流式调用的时限从首次读取时开始。调用方提前结束响应迭代时也会取消整个调用。网络断开或调用失败时，单响应 Promise 拒绝，流在读到失败时抛出错误。调用方可从 `RpcError.code` 获取错误代码。处理函数可抛出 `new RpcError(code, message?, options?)` 指定错误码。应用自行决定是否重试，超时或断线时对端可能已经执行了方法。
 
+`options.openDeadline` 供已经持有调用时限的上层传入 `{ at, cause? }`。`at` 是本进程 `performance.now()` 时间基准上的绝对毫秒值，须为非负有限数。RPC 在提交 `OPEN` 到 socket 前检查该值和 `timeoutMs` 对应的时限，包括发送队列因背压或窗口额度恢复而继续写入时。先到的时限使未提交的 `OPEN` 被丢弃并返回本端 `DEADLINE_EXCEEDED`。若由 `openDeadline` 触发，错误会保留其中的 `cause`。等待队列期间的主动取消仍用 `signal` 或 `timeoutMs`。
+
+`options.beforeResponse` 在每个有效的 `DATA` 或成功 `END` 交给调用方前同步执行，适合上层检查响应时限。同步抛出 `RpcError` 会以本端失败结束该调用，其他异常以 `INTERNAL` 报告并保留 `cause`。返回值会被忽略。对端的 `ERROR` 帧沿用正常错误处理路径。
+
 `options.onResponse` 在处理首个流响应数据或成功结束帧时同步调用一次。成功结束帧也包括单响应和正常空流。观察器按接收帧的顺序执行。
 
-`options.onFailure` 可为已经开始的调用观察一次失败。参数 `RpcCallFailure` 包含调用错误 `error`、来源 `source` 和可选的发送及响应状态。来源 `remote` 表示收到对端的错误帧，`transport` 表示连接终止或发送失败，`local` 表示本端取消、超时或输入失败。若 `OPEN` 已提交到本端 socket，`sentAt` 为提交时的本端 `performance.now()` 值，单位为毫秒。如果流在失败前收到过响应数据，`responseStarted` 为 `true`。
+`options.onFailure` 可为已经开始的调用观察一次失败。参数 `RpcCallFailure` 包含调用错误 `error`、来源 `source` 和可选的发送及响应状态。来源 `remote` 表示收到对端的错误帧，`transport` 表示连接终止或发送失败，`local` 表示本端取消、超时、输入失败或同步响应检查拒绝。若 `OPEN` 已提交到本端 socket，`sentAt` 为提交时的本端 `performance.now()` 值，单位为毫秒。如果流在失败前接受过响应数据，`responseStarted` 为 `true`。
 
 终态观察器在本调用的响应或错误就绪后同步执行，随后取消仍在运行的本地上传。观察器的异常或拒绝由 RPC 忽略。调用开始前的参数校验和已取消状态，以及业务结果和调用错误，都通过返回的 Promise 或迭代器报告。
 

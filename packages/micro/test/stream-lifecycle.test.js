@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createMicroClient } from '@ainess/micro'
-import { RpcMode, RpcServer } from '@ainess/rpc'
+import { RpcError, RpcMode, RpcServer } from '@ainess/rpc'
 
 test('aborting paused responses after wire completion returns shared connection credit', {
   timeout: 10_000,
@@ -77,6 +77,51 @@ test('invalid call options leave no deadline timer behind', async t => {
     /** @returns {never} */
     get input() { throw failure },
   }), failure)
+  await assert.rejects(client.stream('orders', 'events', undefined, {
+    timeoutMs,
+    firstResponseTimeoutMs: 0,
+  }).next(), RangeError)
+  await assert.rejects(client.stream('orders', 'events', undefined, {
+    timeoutMs,
+    firstResponseTimeoutMs: timeoutMs,
+    readIdleTimeoutMs: 0,
+  }).next(), RangeError)
   const cleared = new Set(disarm.mock.calls.map(call => call.arguments[0]))
   assert.equal(timers().filter(timer => !cleared.has(timer)).length, 0)
+})
+
+test('cancellation in a failure observer preserves an upload exception with an unreadable code', {
+  timeout: 5_000,
+}, async t => {
+  const server = await RpcServer.listen({
+    host: '127.0.0.1',
+    port: 0,
+    methods: [{
+      name: 'upload',
+      mode: RpcMode.ClientStream,
+      async handle({ input }) {
+        for await (const chunk of input) return chunk
+        return Buffer.alloc(0)
+      },
+    }, {
+      name: 'echo',
+      mode: RpcMode.Unary,
+      handle: ({ data }) => data,
+    }],
+  })
+  t.after(() => server.close())
+  const client = createMicroClient({ discovery: { async pick() { return server.address } } })
+  t.after(() => client.close())
+
+  const caller = new AbortController()
+  const failure = Object.defineProperty(new RpcError('INTERNAL', 'upload failed'), 'code', {
+    get() { throw new Error('unreadable code') },
+  })
+  await assert.rejects(client.request('orders', 'upload', undefined, {
+    signal: caller.signal,
+    input() { throw failure },
+    onFailure() { caller.abort() },
+  }), error => error === failure)
+  assert.equal(caller.signal.aborted, true)
+  assert.deepEqual(await client.request('orders', 'echo', Buffer.from('next')), Buffer.from('next'))
 })

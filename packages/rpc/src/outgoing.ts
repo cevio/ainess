@@ -18,6 +18,7 @@ interface Call {
   uploadEnded: boolean
   // Observed calls retain the send time. Other sent calls retain just the flag.
   opened: true | number | undefined
+  beforeResponse?: RpcCallOptions['beforeResponse']
   onFailure?: RpcCallOptions['onFailure']
   onResponse?: RpcCallOptions['onResponse']
   responseStarted?: true
@@ -128,10 +129,20 @@ export class OutgoingCalls {
     if (onResponse !== undefined && typeof onResponse !== 'function') {
       throw new RpcError('INVALID_ARGUMENT', 'RPC response observer must be a function')
     }
+    const beforeResponse = options?.beforeResponse
+    if (beforeResponse !== undefined && typeof beforeResponse !== 'function') {
+      throw new RpcError('INVALID_ARGUMENT', 'RPC response check must be a function')
+    }
     const timeoutMs = options?.timeoutMs
     if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 0x7fffffff)) {
       throw new RpcError('INVALID_ARGUMENT', 'Invalid RPC call timeout')
     }
+    const openDeadline = options?.openDeadline
+    const openAt = openDeadline?.at
+    if (openDeadline !== undefined && (typeof openAt !== 'number' || !Number.isFinite(openAt) || openAt < 0)) {
+      throw new RpcError('INVALID_ARGUMENT', 'Invalid RPC OPEN deadline')
+    }
+    const openCause = openDeadline?.cause
     if (signal?.aborted) throw cancelled(signal)
     if (this.modem.failure) throw this.modem.failure
     const mode = (input ? RpcMode.ClientStream : 0) | (target.output ? RpcMode.ServerStream : 0)
@@ -155,6 +166,7 @@ export class OutgoingCalls {
         upload: input ? new AbortController() : undefined,
         uploadEnded: false,
         opened: undefined,
+        beforeResponse,
         onFailure,
         onResponse,
         abort: stopObserving,
@@ -165,18 +177,33 @@ export class OutgoingCalls {
       throw error
     }
     const started = call
+    const timeoutAt = timeoutMs === undefined ? Infinity : performance.now() + timeoutMs
     if (timeoutMs !== undefined) {
       started.timeout = setTimeout(() => {
         this.#cancel(started, new RpcError('DEADLINE_EXCEEDED', 'RPC call timed out'))
       }, timeoutMs).unref()
     }
-    if (this.modem.trySend(open, this.#calls.size > 1)) {
+    const sendBy = Math.min(openAt ?? Infinity, timeoutAt)
+    let openExpiry: RpcError | undefined
+    const beforeOpen = sendBy === Infinity ? undefined : () => {
+      if (performance.now() >= sendBy) {
+        const details = openAt !== undefined && openAt < timeoutAt ? { cause: openCause } : undefined
+        openExpiry = new RpcError('DEADLINE_EXCEEDED', 'RPC call timed out before sending OPEN', details)
+        return openExpiry
+      }
+    }
+    const expired = beforeOpen?.()
+    if (expired) {
+      this.#cancel(started, expired)
+    } else if (this.modem.trySend(open, this.#calls.size > 1)) {
       started.opened = onFailure ? performance.now() : true
       if (input) void Promise.resolve().then(() => this.#upload(started, input)).catch(error => this.#cancel(started, error))
     } else {
-      const queued = this.modem.send(open, () => { started.opened = onFailure ? performance.now() : true })
-      void (input ? queued.then(() => this.#upload(started, input)) : queued)
-        .catch(error => this.#cancel(started, error, started.opened === undefined ? 'transport' : 'local'))
+      const queued = this.modem.send(open, () => { started.opened = onFailure ? performance.now() : true }, beforeOpen)
+      void (input ? queued.then(() => this.#upload(started, input)) : queued).catch(error => {
+        const source = started.opened !== undefined || (openExpiry && error === openExpiry) ? 'local' : 'transport'
+        this.#cancel(started, error, source)
+      })
     }
     return started
   }
@@ -215,25 +242,41 @@ export class OutgoingCalls {
       this.#endInput(call)
       return
     }
-    if (type === FrameType.Data) {
-      if (!call.output) invalidProtocol('Streaming response for a unary result')
-      if (call.onFailure) call.responseStarted = true
-      call.output.push(body, release)
-      if (call.onResponse) this.#notifyResponse(call, call.onResponse)
-      return
-    }
     if (type === FrameType.Error) {
       this.#fail(call, readError(body), 'remote')
       return
     }
-    if (call.output && body.length !== 0) invalidProtocol('Streaming END contains a response body')
+    const { output, beforeResponse } = call
+    if (type === FrameType.Data && !output) invalidProtocol('Streaming response for a unary result')
+    if (type === FrameType.End && output && body.length !== 0) invalidProtocol('Streaming END contains a response body')
+    if (beforeResponse && !this.#acceptResponse(call, beforeResponse, release)) return
+    if (type === FrameType.Data) {
+      if (call.onFailure) call.responseStarted = true
+      output!.push(body, release)
+      if (call.onResponse) this.#notifyResponse(call, call.onResponse)
+      return
+    }
     release()
     this.#retire(call)
-    call.output?.end()
+    output?.end()
     call.result?.resolve(body === EMPTY ? Buffer.alloc(0) : body)
     call.abort?.()
     if (call.onResponse) this.#notifyResponse(call, call.onResponse)
     if (!call.uploadEnded) call.upload?.abort()
+  }
+
+  #acceptResponse(call: Call, check: () => void, release: () => void): boolean {
+    try {
+      const pending = check()
+      if (pending !== undefined) void Promise.resolve(pending).catch(() => {})
+    } catch (cause) {
+      const error = isError(cause, RpcError) ? cause : new RpcError('INTERNAL', 'RPC response check failed', { cause })
+      this.#fail(call, error, 'local', true)
+    }
+    // The check can synchronously retire this call via cancellation or closing its peer.
+    if (this.#calls.has(call.id)) return true
+    release()
+    return false
   }
 
   #notifyResponse(call: Call, onResponse: () => void): void {

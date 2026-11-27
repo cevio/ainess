@@ -23,13 +23,13 @@ description: 按包选择、接入和验证 Ainess。用于装配 Cordis 应用�
 | [@ainess/registry-server](references/registry-server.md) | 监听注册中心端口，按连接管理服务登记并提供轮询选址。 |
 | [@ainess/registry-client](references/registry-client.md) | 登记、查询和选择服务地址，断线重连时恢复登记。 |
 | [@ainess/registry-shared](references/registry-shared.md) | 实现兼容的 Registry RPC 端点或编写协议测试。 |
-| [@ainess/micro](references/micro.md) | 按服务名发起业务 RPC，由客户端复用连接、切换地址和管理熔断。 |
+| [@ainess/micro](references/micro.md) | 按目录装配 RPC 方法，按服务名发起调用并管理连接、选址和熔断。 |
 
 ## 组合使用
 
 - 框架先激活 `plugins`，再启动 `entries`。把数据库、Model 和路由放在前一组，把监听器放在后一组。进程入口可用 CLI 启停。 [应用装配](references/framework.md) · [启动命令](references/cli.md)
 - Controller 在请求边界校验输入，Model 方法通过自己的 `inject` 取得 TypeORM 等依赖。需要在同一端口服务页面时，再为 `httpListener` 装配 Next.js。 [HTTP、Model 和 TypeORM](references/http.md#运行-httpmodel-和-typeorm) · [Next.js](references/http-next.md)
-- 业务监听就绪后通过 Registry 客户端登记。需要自行管理业务连接时，选址后用 RPC 直连。需要按服务名调用时，将发现对象注入 Micro。 [注册与直连](references/registry-client.md) · [Registry 与 Micro](references/micro.md)
+- 业务入口可从 `*.rpc.js` 或 `*.rpc.mjs` 加载 RPC 方法，再启动监听并向 Registry 登记。需要自行管理业务连接时，选址后用 RPC 直连。需要按服务名调用时，将发现对象注入 Micro。 [注册与直连](references/registry-client.md) · [目录加载与 Micro 调用](references/micro.md#通过-micro-调用已登记服务)
 - 独立 Cordis 宿主先停止入口并等待清理，再卸载根 Fiber。使用 framework 时等待 `running.stop()`。连接、定时器等外部资源由创建它们的插件通过 `ctx.effect()` 管理。
 
 ## 开发和验证

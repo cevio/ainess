@@ -16,6 +16,7 @@ type Lane = 'control' | 'short' | 'data'
 interface Pending {
   frame: Frame
   written?: () => void
+  beforeOpen?: () => RpcError | undefined
   done: Deferred<void>
 }
 
@@ -43,6 +44,11 @@ const MAX_FRAME_SIZE = HEADER_SIZE + MAX_BODY
 
 /** @internal */
 export const HANDSHAKE_TIMEOUT_MS = 10_000
+
+/** @internal */
+export function handshakeTimedOut(): RpcError {
+  return new RpcError('UNAVAILABLE', 'RPC handshake timed out')
+}
 
 export function resolveKeepAliveInitialDelay(delay = DEFAULT_KEEP_ALIVE_INITIAL_DELAY_MS): number {
   if (!Number.isInteger(delay) || delay < 1_000 || delay > MAX_KEEP_ALIVE_INITIAL_DELAY_MS) {
@@ -119,11 +125,12 @@ export class MessageModem {
     private readonly onClose: (error: RpcError, reason: RpcCloseReason) => void,
     private readonly onReady?: () => void,
     keepAliveInitialDelayMs = DEFAULT_KEEP_ALIVE_INITIAL_DELAY_MS,
+    private readonly helloDeadline?: number,
   ) {
     this.#localParity = role === 'dialer' ? 1 : 0
     if (role === 'acceptor') {
       this.#handshake = setTimeout(
-        () => this.close(new RpcError('UNAVAILABLE', 'RPC handshake timed out')),
+        () => this.close(handshakeTimedOut()),
         HANDSHAKE_TIMEOUT_MS,
       ).unref()
     }
@@ -247,12 +254,12 @@ export class MessageModem {
     }
   }
 
-  send(value: Frame, written?: () => void): Promise<void> {
+  send(value: Frame, written?: () => void, beforeOpen?: Pending['beforeOpen']): Promise<void> {
     if (this.#reason) return Promise.reject(this.#reason)
     const channel = lane(value)
     const call = channel === 'data' ? this.#calls.get(value.id) : undefined
     if (channel === 'data' && !call) return Promise.reject(CALL_FINISHED)
-    const pending = { frame: value, written, done: deferred<void>() }
+    const pending = { frame: value, written, beforeOpen, done: deferred<void>() }
     if (channel === 'control') {
       this.#control.add(pending)
       let controls = this.#controlByCall.get(value.id)
@@ -302,7 +309,12 @@ export class MessageModem {
   #receive(value: Frame): void {
     if (value.type === FrameType.Hello) {
       if (this.#peer || value.id !== 0 || value.flags !== 0) invalidProtocol('Unexpected RPC HELLO')
-      this.#peer = decodeHello(value.body)
+      const peer = decodeHello(value.body)
+      if (this.helloDeadline !== undefined && performance.now() >= this.helloDeadline) {
+        void this.close(handshakeTimedOut())
+        return
+      }
+      this.#peer = peer
       this.#sendShort = this.#peer.messageWindow
       this.#sendData = this.#peer.streamWindow
       this.#replyReserve = Math.min(MAX_FRAME_SIZE, this.#sendData - MAX_FRAME_SIZE)
@@ -439,8 +451,15 @@ export class MessageModem {
 
   #flushMessages(): void {
     for (const [id, pending] of this.#short) {
+      if (!this.#writable) break
+      const expired = pending.beforeOpen?.()
+      if (expired) {
+        this.#short.delete(id)
+        pending.done.reject(expired)
+        continue
+      }
       const bytes = HEADER_SIZE + pending.frame.body.length
-      if (!this.#writable || bytes > this.#sendShort) break
+      if (bytes > this.#sendShort) break
       this.#short.delete(id)
       this.#sendShort -= bytes
       this.#writePending(pending)

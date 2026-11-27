@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { createConnection, createServer, Socket } from 'node:net'
 import test from 'node:test'
-import { RpcMode, RpcServer } from '@ainess/rpc'
+import { RpcError, RpcMode, RpcPeer, RpcServer, rpcPayloadLimit } from '@ainess/rpc'
 import { deferred } from '../dist/deferred.js'
 import { frame, openFrame } from '../dist/messages.js'
 import { MessageModem } from '../dist/modem.js'
@@ -102,6 +102,119 @@ test('retiring a call drops all its queued controls and preserves the order of t
   assert.deepEqual(written, [1, 3, 4])
   assert.deepEqual(outcomes.map(outcome => outcome.status === 'rejected' ? outcome.reason.code : outcome.status),
     ['CANCELLED', 'fulfilled', 'CANCELLED', 'fulfilled', 'fulfilled'])
+})
+
+test('the RPC call timeout drops an OPEN still queued under backpressure', { timeout: 5_000 }, async t => {
+  let now = 1_000
+  t.mock.method(performance, 'now', () => now)
+  /** @type {string[]} */
+  const executions = []
+  const server = await RpcServer.listen({
+    host: '127.0.0.1',
+    port: 0,
+    methods: [{
+      name: 'echo',
+      mode: RpcMode.Unary,
+      handle({ data }) {
+        executions.push(Buffer.from(data).toString())
+        return data
+      },
+    }],
+  })
+  t.after(() => server.close())
+
+  /** @type {Socket | undefined} */
+  let dialer
+  const keepAlive = Socket.prototype.setKeepAlive
+  /** @this {Socket} @param {boolean} [enable] @param {number} [idle] */
+  function holdAfterHello(enable, idle) {
+    if (this.remotePort === server.address.port) {
+      dialer = this
+      const write = this.write
+      t.mock.method(this, 'write', (/** @type {Uint8Array} */ bytes) => {
+        const written = write.call(this, bytes)
+        return bytes[8] === FrameType.Hello ? false : written
+      })
+    }
+    return keepAlive.call(this, enable, idle)
+  }
+  t.mock.method(Socket.prototype, 'setKeepAlive', holdAfterHello)
+  const peer = await RpcPeer.connect(server.address)
+  t.after(() => peer.close())
+  assert.ok(dialer)
+
+  /** @type {import('@ainess/rpc').RpcCallFailure[]} */
+  const failures = []
+  const expired = peer.request('echo', Buffer.from('expired'), {
+    timeoutMs: 250,
+    onFailure(failure) { failures.push(failure) },
+  })
+  const next = peer.request('echo', Buffer.from('next'))
+  const results = Promise.allSettled([expired, next])
+  now += 300
+  dialer.emit('drain')
+
+  const [deadline, response] = await results
+  assert.deepEqual(executions, ['next'])
+  assert.equal(deadline.status, 'rejected')
+  assert.equal(deadline.reason.code, 'DEADLINE_EXCEEDED')
+  assert.deepEqual(failures.map(({ source, sentAt }) => [source, sentAt]), [['local', undefined]])
+  assert.deepEqual(response, { status: 'fulfilled', value: Buffer.from('next') })
+})
+
+test('a queued OPEN preserves a local upload error without reading its code', { timeout: 5_000 }, async t => {
+  const server = await RpcServer.listen({
+    host: '127.0.0.1',
+    port: 0,
+    methods: [
+      { name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data },
+      {
+        name: 'upload',
+        mode: RpcMode.ClientStream,
+        async handle({ input }) {
+          for await (const chunk of input) void chunk
+          return Buffer.alloc(0)
+        },
+      },
+    ],
+  })
+  t.after(() => server.close())
+
+  /** @type {Socket | undefined} */
+  let dialer
+  const keepAlive = Socket.prototype.setKeepAlive
+  /** @this {Socket} @param {boolean} [enable] @param {number} [idle] */
+  function captureDialer(enable, idle) {
+    if (this.remotePort === server.address.port) dialer = this
+    return keepAlive.call(this, enable, idle)
+  }
+  t.mock.method(Socket.prototype, 'setKeepAlive', captureDialer)
+  const peer = await RpcPeer.connect(server.address)
+  t.after(() => peer.close())
+  assert.ok(dialer)
+
+  const uploadError = Object.defineProperty(new RpcError('INTERNAL', 'upload failed'), 'code', {
+    get() { throw new Error('unreadable upload error code') },
+  })
+  /** @type {import('@ainess/rpc').RpcCallFailure[]} */
+  const failures = []
+  const fullPayload = Buffer.alloc(rpcPayloadLimit('echo'))
+  dialer.cork()
+  const replies = Array.from({ length: 4 }, () => peer.request('echo', fullPayload))
+  assert.equal(dialer.writableNeedDrain, true)
+  const upload = peer.request('upload', {
+    input() { throw uploadError },
+    onFailure(failure) { failures.push(failure) },
+    timeoutMs: 1_000,
+  })
+  dialer.uncork()
+
+  await assert.rejects(upload, error => error === uploadError)
+  assert.equal(failures.length, 1)
+  assert.equal(failures[0].source, 'local')
+  assert.equal(typeof failures[0].sentAt, 'number')
+  await Promise.all(replies)
+  assert.deepEqual(await peer.request('echo', Buffer.from('next')), Buffer.from('next'))
 })
 
 test('cancelling a rejected call discards its queued error under socket backpressure', {

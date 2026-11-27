@@ -309,6 +309,9 @@ importers:
 
   packages/micro:
     dependencies:
+      '@ainess/loader':
+        specifier: workspace:*
+        version: link:../loader
       '@ainess/rpc':
         specifier: workspace:*
         version: link:../rpc

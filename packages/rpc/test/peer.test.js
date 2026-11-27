@@ -6,6 +6,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { RpcClient, RpcMode, RpcPeer, RpcServer } from '@ainess/rpc'
+import { openFrame } from '../dist/messages.js'
 import { encodeHeader, encodeHello, FrameType } from '../dist/wire.js'
 
 /** @param {string} value */
@@ -185,6 +186,49 @@ test('TCP dial and HELLO share one connection deadline', { timeout: 5_000 }, asy
   t.mock.timers.tick(1_000)
   await expired
   assert.equal(connections, 1)
+})
+
+test('a late HELLO closes the dial without dispatching a following reverse call', { timeout: 5_000 }, async t => {
+  const closed = latch()
+  let now = 1_000
+  let reverseCalls = 0
+  /** @type {Socket | undefined} */
+  let accepted
+  t.mock.method(performance, 'now', () => now)
+
+  const hello = { type: FrameType.Hello, id: 0, flags: 0, body: encodeHello() }
+  const reverse = openFrame(2, 'reverse', new Uint8Array())
+  const listener = createServer(socket => {
+    accepted = socket
+    socket.on('error', () => {})
+    socket.once('close', closed.resolve)
+    socket.once('data', () => {
+      now += 10_000
+      socket.write(Buffer.concat([encodeHeader(hello), hello.body, encodeHeader(reverse), reverse.body]))
+    })
+  })
+  listener.listen(0, '127.0.0.1')
+  await once(listener, 'listening')
+  const address = listener.address()
+  assert.ok(address && typeof address !== 'string')
+  t.after(() => {
+    accepted?.destroy()
+    return new Promise(resolve => listener.close(() => resolve(undefined)))
+  })
+
+  const dial = RpcPeer.connect({ host: address.address, port: address.port }, {
+    methods: [{
+      name: 'reverse',
+      mode: RpcMode.Unary,
+      handle() {
+        reverseCalls++
+        return new Uint8Array()
+      },
+    }],
+  })
+  await assert.rejects(dial, { code: 'UNAVAILABLE', message: 'RPC handshake timed out' })
+  await closed.promise
+  assert.equal(reverseCalls, 0)
 })
 
 test('a single TCP connection accepts concurrent first calls in both directions', { timeout: 5_000 }, async t => {

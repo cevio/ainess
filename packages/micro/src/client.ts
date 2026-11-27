@@ -14,18 +14,39 @@ export interface MicroDiscovery {
 export interface MicroOptions {
   discovery: MicroDiscovery
   timeoutMs?: number
+  resolveTimeoutMs?: number
   connectTimeoutMs?: number
   idleTimeoutMs?: number
   circuitBreaker?: MicroCircuitBreakerOptions | false
+  onTiming?: (event: MicroTimingEvent) => void
+}
+
+type MicroTimingPhase = { readonly service: string } & (
+  | { readonly phase: 'discovery' | 'connect'; readonly attempt: 1 | 2 }
+  | { readonly phase: 'rpc'; readonly method: string }
+)
+
+export type MicroTimingEvent = MicroTimingPhase & {
+  readonly elapsedMs: number
+  readonly outcome: 'success' | 'failure'
+  readonly error?: unknown
 }
 
 export interface MicroCircuitBreakerOptions extends Partial<CircuitBreakerSettings> {
   minTimeoutSampleMs?: number
 }
 
+type MicroCallOptions = Omit<RpcCallOptions, 'openDeadline' | 'beforeResponse'>
+
+export interface MicroStreamOptions extends Omit<MicroCallOptions, 'timeoutMs'> {
+  timeoutMs?: number | false
+  firstResponseTimeoutMs?: number
+  readIdleTimeoutMs?: number
+}
+
 export interface MicroClient {
-  request(service: string, method: string, data?: Bytes, options?: RpcCallOptions): Promise<Bytes>
-  stream(service: string, method: string, data?: Bytes, options?: RpcCallOptions): AsyncIterableIterator<Bytes>
+  request(service: string, method: string, data?: Bytes, options?: MicroCallOptions): Promise<Bytes>
+  stream(service: string, method: string, data?: Bytes, options?: MicroStreamOptions): AsyncIterableIterator<Bytes>
   close(): Promise<void>
 }
 
@@ -129,8 +150,15 @@ function remoteAvailabilityFailure(failure: RpcCallFailure): boolean {
     (failure.error.code === 'UNAVAILABLE' || failure.error.code === 'DEADLINE_EXCEEDED')
 }
 
-function optionsForRpc(signal: AbortSignal, options?: RpcCallOptions): RpcCallOptions {
-  return { signal, input: options?.input, onFailure: options?.onFailure, onResponse: options?.onResponse }
+type StreamReadTimeoutPhase = 'first-response' | 'read-idle'
+
+interface StreamReadDeadline {
+  at: number
+  phase: StreamReadTimeoutPhase
+}
+
+function streamTimedOut(phase: StreamReadTimeoutPhase): RpcError {
+  return new RpcError('DEADLINE_EXCEEDED', `Micro stream ${phase} timed out`, { cause: { phase } })
 }
 
 function observeCall(
@@ -152,8 +180,10 @@ function observeCall(
 class Client implements MicroClient {
   #discovery: MicroDiscovery
   #timeoutMs: number
+  #resolveTimeoutMs: number
   #connectTimeoutMs: number
   #idleTimeoutMs: number
+  #onTiming?: MicroOptions['onTiming']
   #circuitSettings?: CircuitBreakerSettings
   #minTimeoutSampleMs = 0
   #lifetime = new AbortController()
@@ -169,8 +199,13 @@ class Client implements MicroClient {
     if (typeof options.discovery?.pick !== 'function') throw new TypeError('Micro discovery requires pick()')
     this.#discovery = options.discovery
     this.#timeoutMs = positiveInteger(options.timeoutMs ?? 5_000, 'timeoutMs')
+    this.#resolveTimeoutMs = positiveInteger(options.resolveTimeoutMs ?? this.#timeoutMs, 'resolveTimeoutMs')
     this.#connectTimeoutMs = positiveInteger(options.connectTimeoutMs ?? 5_000, 'connectTimeoutMs')
     this.#idleTimeoutMs = positiveInteger(options.idleTimeoutMs ?? 60_000, 'idleTimeoutMs')
+    if (options.onTiming !== undefined && typeof options.onTiming !== 'function') {
+      throw new TypeError('Micro onTiming must be a function')
+    }
+    this.#onTiming = options.onTiming
     const breaker = options.circuitBreaker
     if (breaker !== false) {
       if (breaker !== undefined && (breaker === null || typeof breaker !== 'object' || Array.isArray(breaker))) {
@@ -191,12 +226,14 @@ class Client implements MicroClient {
     this.#sweep = setInterval(() => this.#prune(), Math.min(5_000, this.#idleTimeoutMs)).unref()
   }
 
-  async request(service: string, method: string, data?: Bytes, options?: RpcCallOptions): Promise<Bytes> {
-    const call = this.#callSignal(options)
+  async request(service: string, method: string, data?: Bytes, options?: MicroCallOptions): Promise<Bytes> {
+    const timeoutMs = positiveInteger(options?.timeoutMs ?? this.#timeoutMs, 'timeoutMs')
+    const call = this.#callSignal(timeoutMs, options?.signal)
     let attempt: Attempt | undefined
     try {
-      const effectiveOptions = optionsForRpc(call.signal, options)
-      return await this.#dispatch(service, call.signal, selected => {
+      const effectiveOptions = call.optionsForRpc(options)
+      effectiveOptions.beforeResponse = () => call.checkDeadline(performance.now())
+      return await this.#dispatch(service, call, selected => {
         attempt = selected
         if (selected.ticket !== undefined) {
           observeCall(selected, effectiveOptions, failure => {
@@ -206,6 +243,10 @@ class Client implements MicroClient {
               expiredAt - failure.sentAt >= this.#minTimeoutSampleMs
             settle(selected, remoteAvailabilityFailure(failure) || timedOut ? false : undefined)
           })
+        }
+        if (this.#onTiming) {
+          return this.#measure({ phase: 'rpc', service, method },
+            () => selected.connection.peer.request(method, data, effectiveOptions), call.recordFailure)
         }
         return selected.connection.peer.request(method, data, effectiveOptions)
       })
@@ -218,7 +259,7 @@ class Client implements MicroClient {
     }
   }
 
-  stream(service: string, method: string, data?: Bytes, options?: RpcCallOptions): AsyncIterableIterator<Bytes> {
+  stream(service: string, method: string, data?: Bytes, options?: MicroStreamOptions): AsyncIterableIterator<Bytes> {
     const stop = new AbortController()
     const response = this.#stream(service, method, data, options, stop.signal)
     return {
@@ -239,15 +280,33 @@ class Client implements MicroClient {
     service: string,
     method: string,
     data: Bytes | undefined,
-    options: RpcCallOptions | undefined,
+    options: MicroStreamOptions | undefined,
     stop: AbortSignal,
   ): AsyncGenerator<Bytes, void> {
-    const call = this.#callSignal(options, stop)
+    const { timeoutMs, firstResponseTimeoutMs, readIdleTimeoutMs, signal } = options ?? {}
+    const totalMs = timeoutMs === false ? false : positiveInteger(timeoutMs ?? this.#timeoutMs, 'timeoutMs')
+    if (firstResponseTimeoutMs !== undefined) positiveInteger(firstResponseTimeoutMs, 'firstResponseTimeoutMs')
+    if (readIdleTimeoutMs !== undefined) positiveInteger(readIdleTimeoutMs, 'readIdleTimeoutMs')
+    const call = this.#callSignal(totalMs, signal, stop)
     let attempt: Attempt | undefined
     let reader: AsyncIterableIterator<Bytes> | undefined
     let shutdown: Promise<unknown> | undefined
+    let phaseTimer: NodeJS.Timeout | undefined
+    let readDeadline: StreamReadDeadline | undefined
+    const armPhase = (ms: number | undefined, phase: StreamReadTimeoutPhase) => {
+      if (ms === undefined) return
+      readDeadline = { at: performance.now() + ms, phase }
+      phaseTimer = setTimeout(() => call.timeout.abort(streamTimedOut(phase)), ms).unref()
+      return readDeadline
+    }
+    const clearPhase = () => {
+      clearTimeout(phaseTimer)
+      phaseTimer = undefined
+      readDeadline = undefined
+    }
     const finish = () => {
       if (shutdown) return shutdown
+      clearPhase()
       call.finish()
       call.signal.removeEventListener('abort', abort)
       try {
@@ -265,28 +324,40 @@ class Client implements MicroClient {
     }
     const abort = () => { void finish().catch(() => {}) }
     try {
-      let item = await this.#dispatch(service, call.signal, selected => {
+      const firstDeadline = armPhase(firstResponseTimeoutMs, 'first-response')
+      const effectiveOptions = call.optionsForRpc(options, firstDeadline)
+      if (totalMs !== false || firstDeadline || readIdleTimeoutMs !== undefined) {
+        effectiveOptions.beforeResponse = () => {
+          call.checkDeadline(performance.now(), readDeadline)
+          if (readDeadline) clearPhase()
+        }
+      }
+      let item = await this.#dispatch(service, call, selected => {
         attempt = selected
-        const effectiveOptions = optionsForRpc(call.signal, options)
         if (selected.ticket !== undefined) {
           observeCall(selected, effectiveOptions, failure => {
             settle(selected, remoteAvailabilityFailure(failure) ? false : undefined)
           })
         }
         reader = selected.connection.peer.stream(method, data, effectiveOptions)
-        const reading = reader.next()
+        const reading = this.#onTiming
+          ? this.#measure({ phase: 'rpc', service, method }, () => reader!.next(), call.recordFailure)
+          : reader.next()
         // Return the reader on abort even if RPC already received END and left unread frames buffered.
         if (call.signal.aborted) abort()
         else call.signal.addEventListener('abort', abort, { once: true })
         return reading
-      })
-      call.signal.throwIfAborted()
+      }, firstDeadline)
+      clearPhase()
+      call.throwIfAborted()
       for (;;) {
         if (item.done) return
         yield item.value
-        call.signal.throwIfAborted()
+        call.checkDeadline(performance.now())
+        armPhase(readIdleTimeoutMs, 'read-idle')
         item = await reader!.next()
-        call.signal.throwIfAborted()
+        clearPhase()
+        call.throwIfAborted()
       }
     } catch (error) {
       throw call.failure(error)
@@ -303,31 +374,83 @@ class Client implements MicroClient {
     return this.#closing
   }
 
-  #callSignal(options?: RpcCallOptions, stop?: AbortSignal) {
-    const timeoutMs = positiveInteger(options?.timeoutMs ?? this.#timeoutMs, 'timeoutMs')
+  #callSignal(timeoutMs: number | false, callerSignal?: AbortSignal, streamStop?: AbortSignal) {
     const timeout = new AbortController()
     const lifetime = this.#lifetime.signal
     const signals = [lifetime, timeout.signal]
-    const callerSignal = options?.signal
     if (callerSignal) signals.push(callerSignal)
-    if (stop) signals.push(stop)
+    if (streamStop) signals.push(streamStop)
     const signal = AbortSignal.any(signals)
-    const deadline = performance.now() + timeoutMs
+    const deadline = timeoutMs === false ? Infinity : performance.now() + timeoutMs
     let expiredAt: number | undefined
-    const timer = setTimeout(() => {
+    let settledFailure: { error: unknown } | undefined
+    const recordFailure = (error: unknown) => {
+      if (!signal.aborted) settledFailure = { error }
+    }
+    const throwIfAborted = () => {
+      if (settledFailure && signal.aborted && signal.reason !== timeout.signal.reason) throw settledFailure.error
+      signal.throwIfAborted()
+    }
+    const expireTotal = (now: number) => {
       // Event-loop delay cannot extend the response budget used by the circuit breaker.
-      expiredAt = Math.min(performance.now(), deadline)
-      timeout.abort(new RpcError('DEADLINE_EXCEEDED', 'Micro call timed out'))
-    }, timeoutMs).unref()
+      expiredAt = Math.min(now, deadline)
+      const options = streamStop ? { cause: { phase: 'total' } } : undefined
+      timeout.abort(new RpcError('DEADLINE_EXCEEDED', 'Micro call timed out', options))
+    }
+    const timer = timeoutMs === false ? undefined
+      : setTimeout(() => expireTotal(performance.now()), timeoutMs).unref()
     return {
       signal,
+      timeout,
+      throwIfAborted,
+      recordFailure,
       finish: () => clearTimeout(timer),
       expiredAt: () => signal.reason === timeout.signal.reason ? expiredAt : undefined,
+      optionsForRpc(
+        options?: Pick<MicroCallOptions, 'input' | 'onFailure' | 'onResponse'>,
+        firstResponseDeadline?: StreamReadDeadline,
+      ): RpcCallOptions {
+        const { input, onFailure, onResponse } = options ?? {}
+        let openDeadline: RpcCallOptions['openDeadline']
+        if (firstResponseDeadline && firstResponseDeadline.at < deadline) {
+          openDeadline = { at: firstResponseDeadline.at, cause: { phase: firstResponseDeadline.phase } }
+        } else if (deadline !== Infinity) {
+          openDeadline = { at: deadline, cause: streamStop ? { phase: 'total' } : undefined }
+        }
+        return {
+          signal,
+          input,
+          onResponse,
+          openDeadline,
+          onFailure: typeof onFailure === 'function' ? failure => {
+            // The transport settles before invoking onFailure, which can then abort the call signal.
+            recordFailure(failure.error)
+            return onFailure(failure)
+          } : onFailure,
+        }
+      },
+      checkDeadline(now: number, readDeadline?: StreamReadDeadline) {
+        throwIfAborted()
+        // Selection and response processing can run before an overdue timer callback.
+        if (readDeadline && readDeadline.at < deadline && now >= readDeadline.at) {
+          timeout.abort(streamTimedOut(readDeadline.phase))
+        } else if (now >= deadline) {
+          expireTotal(now)
+        }
+        throwIfAborted()
+      },
       failure(error: unknown): unknown {
-        if (!signal.aborted) return error
+        if (!signal.aborted || (settledFailure && Object.is(error, settledFailure.error))) return error
         const reason = signal.reason
-        const cancelledBySignal = Object.is(error, reason) ||
-          (error instanceof RpcError && error.code === 'CANCELLED' && Object.is(error.cause, reason))
+        let cancelledBySignal = Object.is(error, reason)
+        if (!cancelledBySignal) {
+          try {
+            cancelledBySignal = error instanceof RpcError && error.code === 'CANCELLED' && Object.is(error.cause, reason)
+          } catch {
+            // A failure observer can abort while an application error is propagating.
+            return error
+          }
+        }
         if (!cancelledBySignal) return error
         if (reason === lifetime.reason || reason === timeout.signal.reason) return reason
         return new RpcError('CANCELLED', 'Micro call cancelled', { cause: reason })
@@ -335,16 +458,22 @@ class Client implements MicroClient {
     }
   }
 
-  async #dispatch<T>(service: string, signal: AbortSignal, start: (attempt: Attempt) => Promise<T>): Promise<T> {
+  async #dispatch<T>(
+    service: string,
+    call: { signal: AbortSignal; checkDeadline(now: number, readDeadline?: StreamReadDeadline): void },
+    start: (attempt: Attempt) => Promise<T>,
+    firstResponseDeadline?: StreamReadDeadline,
+  ): Promise<T> {
     if (typeof service !== 'string' || !service.trim()) {
       throw new RpcError('INVALID_ARGUMENT', 'Micro service must be a non-blank string')
     }
+    const { signal } = call
     signal.throwIfAborted()
     let route = this.#routes.get(service)
     if (!route) this.#routes.set(service, route = { service, endpoints: new Map() })
     for (;;) {
-      signal.throwIfAborted()
       const now = performance.now()
+      call.checkDeadline(now, firstResponseDeadline)
       const selection = availableConnection(route, now)
       if (selection) {
         const { connection, breaker } = selection
@@ -371,7 +500,12 @@ class Client implements MicroClient {
         route.pending = pending
         this.#lookups.add(pending)
       }
-      await waitFor(route.pending, signal)
+      try {
+        await waitFor(route.pending, signal)
+      } catch (error) {
+        call.checkDeadline(performance.now(), firstResponseDeadline)
+        throw error
+      }
     }
   }
 
@@ -385,50 +519,133 @@ class Client implements MicroClient {
     return retryAt
   }
 
+  async #measure<T>(
+    phase: MicroTimingPhase,
+    run: () => Promise<T>,
+    recordFailure?: (error: unknown) => void,
+  ): Promise<T> {
+    const started = performance.now()
+    const report = (result: Pick<MicroTimingEvent, 'outcome' | 'error'>) => {
+      const event = { ...phase, ...result, elapsedMs: performance.now() - started }
+      try {
+        void Promise.resolve(this.#onTiming?.(event)).catch(() => {})
+      } catch {
+        // Timing observers do not affect call outcomes.
+      }
+    }
+    try {
+      const result = await run()
+      report({ outcome: 'success' })
+      return result
+    } catch (error) {
+      recordFailure?.(error)
+      report({ outcome: 'failure', error })
+      throw error
+    }
+  }
+
   async #select(route: Route): Promise<void> {
     const { service } = route
     const lifetime = this.#lifetime.signal
+    const deadlineAt = performance.now() + this.#resolveTimeoutMs
+    const timeout = AbortSignal.timeout(this.#resolveTimeoutMs)
+    const resolution = AbortSignal.any([lifetime, timeout])
+    let selection = resolution
+    const remaining = () => {
+      lifetime.throwIfAborted()
+      const ms = deadlineAt - performance.now()
+      if (timeout.aborted || ms <= 0) {
+        throw unavailable(service, timeout.reason ?? new RpcError('DEADLINE_EXCEEDED', 'Micro selection timed out'))
+      }
+      return ms
+    }
     const failedAddresses = new Map<string, RpcAddress>()
     let failure: RpcError | undefined
-    for (let attempt = 0; attempt < 2; attempt++) {
-      lifetime.throwIfAborted()
+    let firstDial: Promise<void> | undefined
+    for (const attempt of [1, 2] as const) {
+      remaining()
       const now = performance.now()
       if (availableConnection(route, now)) return
       const exclude = this.#exclusions(route, failedAddresses, now)
       const query = exclude.size ? { service, exclude: Array.from(exclude.values(), address => ({ ...address })) }
         : { service }
-      const deadline = AbortSignal.any([lifetime, AbortSignal.timeout(this.#connectTimeoutMs)])
+      const pickTimeout = new AbortController()
+      const deadline = AbortSignal.any([selection, pickTimeout.signal])
+      const pick = async () => {
+        const expiresAt = performance.now() + this.#connectTimeoutMs
+        const expire = () => pickTimeout.abort(new DOMException('Micro discovery timed out', 'TimeoutError'))
+        const timer = setTimeout(expire, this.#connectTimeoutMs).unref()
+        try {
+          return await waitFor(this.#discovery.pick(query, { signal: deadline }), deadline)
+        } finally {
+          clearTimeout(timer)
+          // The discovery promise can settle before the event loop runs an overdue timer.
+          if (!deadline.aborted && performance.now() >= expiresAt) expire()
+          deadline.throwIfAborted()
+        }
+      }
       let selected: RpcAddress | null
       try {
-        selected = await waitFor(this.#discovery.pick(query, { signal: deadline }), deadline)
+        selected = await (this.#onTiming ? this.#measure({ phase: 'discovery', service, attempt }, pick) : pick())
       } catch (error) {
-        lifetime.throwIfAborted()
+        remaining()
         if (availableConnection(route)) return
+        if (firstDial) break
         throw deadline.aborted ? unavailable(service, error) : error
       }
-      lifetime.throwIfAborted()
+      remaining()
       if (availableConnection(route)) return
       const target = selected === null ? null : readEndpoint(selected)
       if (!target || exclude.has(target.key)) {
-        if (!target && attempt === 0 && exclude.size) {
+        if (!target && attempt === 1 && exclude.size) {
           const current = this.#exclusions(route, failedAddresses, performance.now())
           if ([...exclude.keys()].some(key => !current.has(key))) continue
         }
-        throw failure ?? unavailable(service)
+        break
       }
       const endpoint = this.#endpoint(target.key, target.address, route)
       const selectedAt = performance.now()
       if (route.endpoints.get(endpoint)?.allows(selectedAt) === false) continue
       if (endpoint.retryAt <= selectedAt && [...endpoint.connections].some(available)) return
+      const half = Math.max(1, Math.floor(remaining() / 2))
+      // Reserve time for a second selection without cancelling the address's shared dial.
+      const cutoff = attempt === 1 && half < this.#connectTimeoutMs ? AbortSignal.timeout(half) : undefined
+      const signal = cutoff ? AbortSignal.any([selection, cutoff]) : selection
+      const dial = this.#connect(endpoint)
+      const connect = () => waitFor(dial, signal)
       try {
-        await this.#connect(endpoint)
-        return
+        await (this.#onTiming ? this.#measure({ phase: 'connect', service, attempt }, connect) : connect())
       } catch (error) {
-        lifetime.throwIfAborted()
-        if (!(error instanceof RpcError) || error.code !== 'UNAVAILABLE') throw error
+        remaining()
+        if (availableConnection(route)) return
+        if (cutoff?.aborted && Object.is(error, cutoff.reason)) {
+          firstDial = dial
+          const recovered = new AbortController()
+          selection = AbortSignal.any([resolution, recovered.signal])
+          // The first socket can finish while the route looks for an alternative.
+          void dial.then(() => recovered.abort(), () => {})
+        } else if (!(error instanceof RpcError) || error.code !== 'UNAVAILABLE') {
+          if (firstDial) break
+          throw error
+        }
         failure = unavailable(service, error)
         failedAddresses.set(target.key, endpoint.address)
+        continue
       }
+      remaining()
+      return
+    }
+    if (firstDial) {
+      remaining()
+      const connect = () => waitFor(firstDial, resolution)
+      try {
+        await (this.#onTiming ? this.#measure({ phase: 'connect', service, attempt: 2 }, connect) : connect())
+      } catch (error) {
+        remaining()
+        throw unavailable(service, error)
+      }
+      remaining()
+      return
     }
     throw failure ?? unavailable(service)
   }
@@ -473,8 +690,13 @@ class Client implements MicroClient {
     const lifetime = this.#lifetime.signal
     let peer: RpcPeer
     try {
+      const expiresAt = performance.now() + this.#connectTimeoutMs
       const signal = AbortSignal.any([lifetime, AbortSignal.timeout(this.#connectTimeoutMs)])
       peer = await RpcPeer.connect(endpoint.address, { signal })
+      if (performance.now() >= expiresAt) {
+        await peer.close()
+        throw new DOMException('Micro dial timed out', 'TimeoutError')
+      }
     } catch (cause) {
       lifetime.throwIfAborted()
       const now = performance.now()

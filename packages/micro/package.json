@@ -8,12 +8,17 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./controllers": {
+      "types": "./dist/controllers.d.ts",
+      "default": "./dist/controllers.js"
     }
   },
   "scripts": {
     "build": "tsc"
   },
   "dependencies": {
+    "@ainess/loader": "workspace:*",
     "@ainess/rpc": "workspace:*"
   },
   "peerDependencies": {

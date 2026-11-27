@@ -15,7 +15,7 @@ Ainess 是一个基于 `@deepseek-ai/cordis` 的 TypeScript ESM monorepo。Cordi
 | [@ainess/ioredis](packages/ioredis/README.md) | 注入原生 Redis 单节点、Sentinel 或 Cluster 客户端。 |
 | [@ainess/loader](packages/loader/README.md) | 在消费包中复用模块扫描、导入与文件路由解析。 |
 | [@ainess/rpc](packages/rpc/README.md) | 在同一 TCP 长连接两端发起和处理单响应或流式 RPC，支持运行时注册、注销和调用结果观察。[单连接性能实测](packages/rpc/README.md#单连接性能实测) |
-| [@ainess/micro](packages/micro/README.md) | 按服务名调用远程 RPC，合并发现与拨号，复用业务连接并对持续失败的实例熔断。 |
+| [@ainess/micro](packages/micro/README.md) | 按目录装配 RPC 方法，按服务名调用远程 RPC，并管理连接复用和实例熔断。 |
 | [@ainess/registry-server](packages/registry-server/README.md) | 提供服务注册、查询和等权轮询选址，按连接管理登记。 |
 | [@ainess/registry-client](packages/registry-client/README.md) | 复用 TCP 控制连接登记和发现服务，重连后恢复登记。 |
 | [@ainess/registry-shared](packages/registry-shared/README.md) | 维护 Registry 两端共用的 RPC 协议和控制连接参数。 |
@@ -77,7 +77,7 @@ export default () => ({
 - 需要同一个端口提供 API 和页面时，在当前的 `httpListener` 入口传入 `prepare: httpNext(...)`，并按项目需要选择前缀分流或共享 Koa 中间件。 [Next.js 装配示例](skills/ainess/references/http-next.md)
 - 应用可以用 `RpcServer` 监听端口，用 `RpcPeer` 建立 TCP RPC 连接。连接两端都能调用对方的方法，传输通过字节窗口和 TCP 背压调度。Registry 和业务 RPC 的连接两端须使用相同的 `HELLO` 布局。Cordis 应用可由创建连接的插件托管其生命周期。 [RPC 协议](packages/rpc/README.md#传输协议) · [Cordis 装配示例](skills/ainess/references/rpc.md)
 - 先启动 Registry 服务端和业务 RPC 监听器，再用 Registry 客户端登记服务。消费方通过 `discovery.pick({ service, exclude? })` 取得一个地址，直接建立业务 RPC 连接。 [注册、发现和直连示例](skills/ainess/references/registry-client.md)
-- 调用方可把 `ctx.registryClient.discovery` 注入 `micro`，再通过 `ctx.micro.request()` 按服务名调用。同服务的并发调用合并选址，业务连接按地址复用，熔断时跳过对应的服务实例。 [Registry 与 Micro 装配示例](skills/ainess/references/micro.md)
+- 业务入口可用 `@ainess/micro/controllers` 从目录加载 RPC 方法，传给 `RpcServer.listen()` 后向 Registry 登记。调用方把 `ctx.registryClient.discovery` 注入 `micro`，再通过 `ctx.micro.request()` 按服务名调用。 [目录加载、登记、调用与清理示例](skills/ainess/references/micro.md#通过-micro-调用已登记服务)
 
 ## 安装 Agent 技能
 

@@ -226,13 +226,79 @@ test('the first stream data notifies synchronously before a following failure', 
   /** @type {string[]} */
   const notifications = []
   const stream = peer.stream('stream', {
+    beforeResponse() { notifications.push('check') },
     onResponse() { notifications.push('response') },
     onFailure() { notifications.push('failure') },
   })
   assert.deepEqual(await stream.next(), { value: Buffer.of(1), done: false })
   assert.deepEqual(await stream.next(), { value: Buffer.of(2), done: false })
   await assert.rejects(stream.next(), { code: 'UNAVAILABLE' })
-  assert.deepEqual(notifications, ['response', 'failure'])
+  assert.deepEqual(notifications, ['check', 'response', 'check', 'failure'])
+})
+
+test('a response check can reject success before delivery without closing the connection', { timeout: 5_000 }, async t => {
+  const { peer } = await connect(t, [
+    { name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data },
+    { name: 'empty', mode: RpcMode.ServerStream, async *handle() {} },
+    {
+      name: 'stream',
+      mode: RpcMode.ServerStream,
+      async *handle() {
+        yield Buffer.of(1)
+        yield Buffer.of(2)
+      },
+    },
+  ])
+  const rejected = new RpcError('DEADLINE_EXCEEDED')
+  /** @type {RpcCallFailure[]} */
+  const failures = []
+  let accepted = 0
+  const rejectResponse = {
+    beforeResponse() { throw rejected },
+    onFailure(/** @type {RpcCallFailure} */ failure) { failures.push(failure) },
+    onResponse() { accepted++ },
+  }
+  await assert.rejects(peer.request('echo', rejectResponse), error => error === rejected)
+  await assert.rejects(peer.stream('empty', rejectResponse).next(), error => error === rejected)
+
+  let checked = 0
+  const cause = new Error('response check failed')
+  const stream = peer.stream('stream', {
+    ...rejectResponse,
+    beforeResponse() { if (++checked === 2) throw cause },
+  })
+  assert.deepEqual(await stream.next(), { done: false, value: Buffer.of(1) })
+  await assert.rejects(stream.next(), { code: 'INTERNAL', cause })
+  assert.equal(accepted, 1)
+  assert.deepEqual(failures.map(({ source }) => source), ['local', 'local', 'local'])
+  assert.equal(failures[2].responseStarted, true)
+  assert.deepEqual(await peer.request('echo', Buffer.of(7)), Buffer.of(7))
+})
+
+test('reentrant cancellation and close in a response check prevent delivery', { timeout: 5_000 }, async t => {
+  const { peer } = await connect(t, [
+    { name: 'echo', mode: RpcMode.Unary, handle: ({ data }) => data },
+    { name: 'stream', mode: RpcMode.ServerStream, async *handle() { yield Buffer.alloc(MAX_BODY) } },
+  ])
+  const controller = new AbortController()
+  const reason = new Error('caller cancelled in response check')
+  let accepted = 0
+  const stream = peer.stream('stream', {
+    signal: controller.signal,
+    beforeResponse() {
+      controller.abort(reason)
+      throw new RpcError('DEADLINE_EXCEEDED')
+    },
+    onResponse() { accepted++ },
+  })
+  await assert.rejects(stream.next(), { code: 'CANCELLED', cause: reason })
+  assert.deepEqual(await peer.request('echo', Buffer.of(5)), Buffer.of(5))
+
+  await assert.rejects(peer.request('echo', {
+    beforeResponse() { void peer.close() },
+    onResponse() { accepted++ },
+  }), { code: 'UNAVAILABLE' })
+  assert.equal(accepted, 0)
 })
 
 test('a response observer can cancel a stream as its first data arrives', { timeout: 5_000 }, async t => {

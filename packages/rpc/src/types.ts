@@ -30,9 +30,13 @@ export interface RpcCallFailure {
 }
 
 export interface RpcCallOptions {
+  /** Runs synchronously before each successful response frame is accepted. */
+  beforeResponse?: () => void
   input?: (signal: AbortSignal) => ByteStream
   onFailure?: (failure: RpcCallFailure) => void
   onResponse?: () => void
+  /** Latest OPEN submission time on the local performance.now() clock. */
+  openDeadline?: { readonly at: number; readonly cause?: unknown }
   signal?: AbortSignal
   timeoutMs?: number
 }
